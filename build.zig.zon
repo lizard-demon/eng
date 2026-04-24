@@ -1,0 +1,12 @@
+.{
+    .name = .engine,
+    .version = "0.0.1",
+    .fingerprint = 0xe8a81a8db6b97ad5,
+    .minimum_zig_version = "0.15.2",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
