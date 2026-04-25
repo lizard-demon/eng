@@ -1,209 +1,175 @@
-//! math.zig — zero-cost linear algebra
-//!
-//! Value types, inline methods, zero heap.  Composes via chaining:
-//!   pos.add(vel.scale(dt))
-
+//! math.zig — SIMD linear algebra, column-major matrices
 const std = @import("std");
 
-// ── Vec2 ──────────────────────────────────────────────────────────
-
-pub const Vec2 = struct {
-    v: [2]f32 = .{ 0, 0 },
-    pub const zero = Vec2{};
-    pub inline fn init(x: f32, y: f32) Vec2 { return .{ .v = .{ x, y } }; }
-    pub inline fn add(a: Vec2, b: Vec2) Vec2 { return .{ .v = .{ a.v[0] + b.v[0], a.v[1] + b.v[1] } }; }
-    pub inline fn sub(a: Vec2, b: Vec2) Vec2 { return .{ .v = .{ a.v[0] - b.v[0], a.v[1] - b.v[1] } }; }
-    pub inline fn scale(a: Vec2, s: f32) Vec2 { return .{ .v = .{ a.v[0] * s, a.v[1] * s } }; }
-    pub inline fn dot(a: Vec2, b: Vec2) f32 { return a.v[0] * b.v[0] + a.v[1] * b.v[1]; }
-    pub inline fn lenSq(a: Vec2) f32 { return dot(a, a); }
-    pub inline fn len(a: Vec2) f32 { return @sqrt(lenSq(a)); }
-    pub inline fn norm(a: Vec2) Vec2 { const l = len(a); return if (l > 0) scale(a, 1 / l) else zero; }
-};
-
-// ── Vec3 ──────────────────────────────────────────────────────────
-
-pub const Vec3 = struct {
-    v: [3]f32 = .{ 0, 0, 0 },
-
-    pub const zero = Vec3{};
-    pub const up = Vec3{ .v = .{ 0, 1, 0 } };
-    pub const right = Vec3{ .v = .{ 1, 0, 0 } };
-    pub const forward = Vec3{ .v = .{ 0, 0, -1 } };
-
-    pub inline fn init(x: f32, y: f32, z: f32) Vec3 { return .{ .v = .{ x, y, z } }; }
-    pub inline fn splat(s: f32) Vec3 { return .{ .v = .{ s, s, s } }; }
-    pub inline fn add(a: Vec3, b: Vec3) Vec3 { return .{ .v = .{ a.v[0] + b.v[0], a.v[1] + b.v[1], a.v[2] + b.v[2] } }; }
-    pub inline fn sub(a: Vec3, b: Vec3) Vec3 { return .{ .v = .{ a.v[0] - b.v[0], a.v[1] - b.v[1], a.v[2] - b.v[2] } }; }
-    pub inline fn mul(a: Vec3, b: Vec3) Vec3 { return .{ .v = .{ a.v[0] * b.v[0], a.v[1] * b.v[1], a.v[2] * b.v[2] } }; }
-    pub inline fn scale(a: Vec3, s: f32) Vec3 { return .{ .v = .{ a.v[0] * s, a.v[1] * s, a.v[2] * s } }; }
-    pub inline fn neg(a: Vec3) Vec3 { return .{ .v = .{ -a.v[0], -a.v[1], -a.v[2] } }; }
-
-    pub inline fn dot(a: Vec3, b: Vec3) f32 { return a.v[0] * b.v[0] + a.v[1] * b.v[1] + a.v[2] * b.v[2]; }
+pub const Vec3 = packed struct {
+    data: @Vector(3, f32),
+    pub inline fn new(x: f32, y: f32, z: f32) Vec3 { return .{ .data = .{ x, y, z } }; }
+    pub inline fn zero() Vec3 { return .{ .data = @splat(0) }; }
+    pub inline fn one() Vec3 { return .{ .data = @splat(1) }; }
+    pub inline fn splat(s: f32) Vec3 { return .{ .data = @splat(s) }; }
+    pub inline fn add(v: Vec3, o: Vec3) Vec3 { return .{ .data = v.data + o.data }; }
+    pub inline fn sub(v: Vec3, o: Vec3) Vec3 { return .{ .data = v.data - o.data }; }
+    pub inline fn mul(v: Vec3, o: Vec3) Vec3 { return .{ .data = v.data * o.data }; }
+    pub inline fn neg(v: Vec3) Vec3 { return .{ .data = -v.data }; }
+    pub inline fn scale(v: Vec3, s: f32) Vec3 { return .{ .data = v.data * @as(@Vector(3, f32), @splat(s)) }; }
+    pub inline fn dot(v: Vec3, o: Vec3) f32 { return @reduce(.Add, v.data * o.data); }
+    pub inline fn lengthSq(v: Vec3) f32 { return dot(v, v); }
+    pub inline fn length(v: Vec3) f32 { return @sqrt(lengthSq(v)); }
+    pub inline fn dist(a: Vec3, b: Vec3) f32 { return length(sub(a, b)); }
+    pub inline fn normalize(v: Vec3) Vec3 { const l = length(v); return if (l > 0) scale(v, 1.0 / l) else v; }
     pub inline fn cross(a: Vec3, b: Vec3) Vec3 {
-        return .{ .v = .{
-            a.v[1] * b.v[2] - a.v[2] * b.v[1],
-            a.v[2] * b.v[0] - a.v[0] * b.v[2],
-            a.v[0] * b.v[1] - a.v[1] * b.v[0],
-        } };
+        return Vec3.new(
+            a.data[1] * b.data[2] - a.data[2] * b.data[1],
+            a.data[2] * b.data[0] - a.data[0] * b.data[2],
+            a.data[0] * b.data[1] - a.data[1] * b.data[0],
+        );
     }
-
-    pub inline fn lenSq(a: Vec3) f32 { return dot(a, a); }
-    pub inline fn len(a: Vec3) f32 { return @sqrt(lenSq(a)); }
-    pub inline fn norm(a: Vec3) Vec3 { const l = len(a); return if (l > 0) scale(a, 1 / l) else zero; }
     pub inline fn lerp(a: Vec3, b: Vec3, t: f32) Vec3 { return add(a, sub(b, a).scale(t)); }
-    pub inline fn vmin(a: Vec3, b: Vec3) Vec3 { return .{ .v = .{ @min(a.v[0], b.v[0]), @min(a.v[1], b.v[1]), @min(a.v[2], b.v[2]) } }; }
-    pub inline fn vmax(a: Vec3, b: Vec3) Vec3 { return .{ .v = .{ @max(a.v[0], b.v[0]), @max(a.v[1], b.v[1]), @max(a.v[2], b.v[2]) } }; }
+    pub inline fn min(a: Vec3, b: Vec3) Vec3 { return .{ .data = @min(a.data, b.data) }; }
+    pub inline fn max(a: Vec3, b: Vec3) Vec3 { return .{ .data = @max(a.data, b.data) }; }
 };
 
-// ── Vec4 ──────────────────────────────────────────────────────────
+pub const AABB = packed struct {
+    lo: Vec3,
+    hi: Vec3,
 
-pub const Vec4 = struct {
-    v: [4]f32 = .{ 0, 0, 0, 0 },
-    pub inline fn init(x: f32, y: f32, z: f32, w: f32) Vec4 { return .{ .v = .{ x, y, z, w } }; }
-    pub inline fn fromVec3(p: Vec3, w: f32) Vec4 { return .{ .v = .{ p.v[0], p.v[1], p.v[2], w } }; }
-    pub inline fn xyz(self: Vec4) Vec3 { return .{ .v = .{ self.v[0], self.v[1], self.v[2] } }; }
-};
-
-// ── Quat ──────────────────────────────────────────────────────────
-
-pub const Quat = struct {
-    v: [4]f32 = .{ 0, 0, 0, 1 }, // x, y, z, w
-
-    pub const identity = Quat{};
-
-    pub fn axisAngle(axis: Vec3, angle: f32) Quat {
-        const ha = angle * 0.5;
-        const s = @sin(ha);
-        const a = axis.norm();
-        return .{ .v = .{ a.v[0] * s, a.v[1] * s, a.v[2] * s, @cos(ha) } };
+    pub fn new(lo: Vec3, hi: Vec3) AABB { return .{ .lo = lo, .hi = hi }; }
+    pub fn fromCenterSize(c: Vec3, s: Vec3) AABB {
+        const h = Vec3.scale(s, 0.5);
+        return .{ .lo = Vec3.sub(c, h), .hi = Vec3.add(c, h) };
     }
-
-    pub fn mulQ(a: Quat, b: Quat) Quat {
-        return .{ .v = .{
-            a.v[3] * b.v[0] + a.v[0] * b.v[3] + a.v[1] * b.v[2] - a.v[2] * b.v[1],
-            a.v[3] * b.v[1] - a.v[0] * b.v[2] + a.v[1] * b.v[3] + a.v[2] * b.v[0],
-            a.v[3] * b.v[2] + a.v[0] * b.v[1] - a.v[1] * b.v[0] + a.v[2] * b.v[3],
-            a.v[3] * b.v[3] - a.v[0] * b.v[0] - a.v[1] * b.v[1] - a.v[2] * b.v[2],
-        } };
+    pub fn intersects(a: AABB, b: AABB) bool {
+        return a.lo.data[0] <= b.hi.data[0] and a.hi.data[0] >= b.lo.data[0] and
+            a.lo.data[1] <= b.hi.data[1] and a.hi.data[1] >= b.lo.data[1] and
+            a.lo.data[2] <= b.hi.data[2] and a.hi.data[2] >= b.lo.data[2];
     }
-
-    pub fn rotate(q: Quat, p: Vec3) Vec3 {
-        const u = Vec3{ .v = .{ q.v[0], q.v[1], q.v[2] } };
-        const s = q.v[3];
-        return u.scale(2 * u.dot(p)).add(p.scale(s * s - u.dot(u))).add(u.cross(p).scale(2 * s));
+    pub fn containsPoint(a: AABB, p: Vec3) bool {
+        return p.data[0] >= a.lo.data[0] and p.data[0] <= a.hi.data[0] and
+            p.data[1] >= a.lo.data[1] and p.data[1] <= a.hi.data[1] and
+            p.data[2] >= a.lo.data[2] and p.data[2] <= a.hi.data[2];
     }
-
-    pub fn normalize(q: Quat) Quat {
-        const l = @sqrt(q.v[0] * q.v[0] + q.v[1] * q.v[1] + q.v[2] * q.v[2] + q.v[3] * q.v[3]);
-        return if (l > 0) .{ .v = .{ q.v[0] / l, q.v[1] / l, q.v[2] / l, q.v[3] / l } } else identity;
+    pub fn merge(a: AABB, b: AABB) AABB { return .{ .lo = Vec3.min(a.lo, b.lo), .hi = Vec3.max(a.hi, b.hi) }; }
+    pub fn expand(a: AABB, p: Vec3) AABB { return .{ .lo = Vec3.min(a.lo, p), .hi = Vec3.max(a.hi, p) }; }
+    pub fn center(a: AABB) Vec3 { return Vec3.scale(Vec3.add(a.lo, a.hi), 0.5); }
+    pub fn pad(a: AABB, r: f32) AABB {
+        const rv = Vec3.splat(r);
+        return .{ .lo = Vec3.sub(a.lo, rv), .hi = Vec3.add(a.hi, rv) };
     }
-
-    pub fn slerp(a: Quat, b_in: Quat, t: f32) Quat {
-        var d = a.v[0] * b_in.v[0] + a.v[1] * b_in.v[1] + a.v[2] * b_in.v[2] + a.v[3] * b_in.v[3];
-        var b = b_in;
-        if (d < 0) {
-            d = -d;
-            b = .{ .v = .{ -b.v[0], -b.v[1], -b.v[2], -b.v[3] } };
+    pub fn surfaceArea(a: AABB) f32 {
+        const d = Vec3.sub(a.hi, a.lo);
+        return 2.0 * (d.data[0] * d.data[1] + d.data[1] * d.data[2] + d.data[2] * d.data[0]);
+    }
+    pub fn transform(a: AABB, m: Mat4) AABB {
+        const inf = std.math.floatMax(f32);
+        var r = AABB{ .lo = Vec3.splat(inf), .hi = Vec3.splat(-inf) };
+        for ([_]f32{ a.lo.data[0], a.hi.data[0] }) |x| {
+            for ([_]f32{ a.lo.data[1], a.hi.data[1] }) |y| {
+                for ([_]f32{ a.lo.data[2], a.hi.data[2] }) |z| {
+                    r = r.expand(m.mulVec3(Vec3.new(x, y, z)));
+                }
+            }
         }
-        if (d > 0.9995) return (Quat{ .v = .{
-            a.v[0] + (b.v[0] - a.v[0]) * t, a.v[1] + (b.v[1] - a.v[1]) * t,
-            a.v[2] + (b.v[2] - a.v[2]) * t, a.v[3] + (b.v[3] - a.v[3]) * t,
-        } }).normalize();
-        const theta = std.math.acos(std.math.clamp(d, -1, 1));
-        const st = @sin(theta);
-        const sa = @sin((1 - t) * theta) / st;
-        const sb = @sin(t * theta) / st;
-        return .{ .v = .{
-            a.v[0] * sa + b.v[0] * sb, a.v[1] * sa + b.v[1] * sb,
-            a.v[2] * sa + b.v[2] * sb, a.v[3] * sa + b.v[3] * sb,
-        } };
+        return r;
     }
 
-    pub fn toMat4(q: Quat) Mat4 {
-        const x = q.v[0];
-        const y = q.v[1];
-        const z = q.v[2];
-        const w = q.v[3];
-        return .{ .m = .{
-            .{ 1 - 2 * (y * y + z * z), 2 * (x * y + w * z), 2 * (x * z - w * y), 0 },
-            .{ 2 * (x * y - w * z), 1 - 2 * (x * x + z * z), 2 * (y * z + w * x), 0 },
-            .{ 2 * (x * z + w * y), 2 * (y * z - w * x), 1 - 2 * (x * x + y * y), 0 },
-            .{ 0, 0, 0, 1 },
-        } };
-    }
+    pub const empty: AABB = .{
+        .lo = Vec3{ .data = .{ std.math.floatMax(f32), std.math.floatMax(f32), std.math.floatMax(f32) } },
+        .hi = Vec3{ .data = .{ -std.math.floatMax(f32), -std.math.floatMax(f32), -std.math.floatMax(f32) } },
+    };
 };
-
-// ── Mat4 ──────────────────────────────────────────────────────────
 
 pub const Mat4 = struct {
-    m: [4][4]f32 = .{ .{ 1, 0, 0, 0 }, .{ 0, 1, 0, 0 }, .{ 0, 0, 1, 0 }, .{ 0, 0, 0, 1 } },
+    data: [16]f32,
 
-    pub const identity = Mat4{};
-
-    pub fn mul(a: Mat4, b: Mat4) Mat4 {
-        var r: Mat4 = undefined;
-        inline for (0..4) |i| inline for (0..4) |j| {
-            r.m[i][j] = a.m[i][0] * b.m[0][j] + a.m[i][1] * b.m[1][j] +
-                a.m[i][2] * b.m[2][j] + a.m[i][3] * b.m[3][j];
-        };
-        return r;
+    pub inline fn identity() Mat4 {
+        return .{ .data = .{ 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 } };
     }
 
-    pub fn mulVec4(self: Mat4, v: Vec4) Vec4 {
-        var r: [4]f32 = undefined;
-        inline for (0..4) |i| {
-            r[i] = self.m[i][0] * v.v[0] + self.m[i][1] * v.v[1] +
-                self.m[i][2] * v.v[2] + self.m[i][3] * v.v[3];
+    pub inline fn mul(a: Mat4, b: Mat4) Mat4 {
+        var r: Mat4 = undefined;
+        inline for (0..4) |c| {
+            inline for (0..4) |row| {
+                var s: f32 = 0;
+                inline for (0..4) |k| s += a.data[k * 4 + row] * b.data[c * 4 + k];
+                r.data[c * 4 + row] = s;
+            }
         }
-        return .{ .v = r };
-    }
-
-    pub fn xformPoint(self: Mat4, p: Vec3) Vec3 { return self.mulVec4(Vec4.fromVec3(p, 1)).xyz(); }
-    pub fn xformDir(self: Mat4, d: Vec3) Vec3 { return self.mulVec4(Vec4.fromVec3(d, 0)).xyz(); }
-
-    pub fn translate(t: Vec3) Mat4 {
-        var r = identity;
-        r.m[0][3] = t.v[0];
-        r.m[1][3] = t.v[1];
-        r.m[2][3] = t.v[2];
         return r;
     }
 
-    pub fn scaling(s: Vec3) Mat4 {
-        var r = identity;
-        r.m[0][0] = s.v[0];
-        r.m[1][1] = s.v[1];
-        r.m[2][2] = s.v[2];
-        return r;
-    }
-
-    pub fn perspective(fovy: f32, aspect: f32, near: f32, far: f32) Mat4 {
-        const f = 1.0 / @tan(fovy * 0.5);
-        var r: Mat4 = .{ .m = .{ .{ 0, 0, 0, 0 }, .{ 0, 0, 0, 0 }, .{ 0, 0, 0, 0 }, .{ 0, 0, 0, 0 } } };
-        r.m[0][0] = f / aspect;
-        r.m[1][1] = f;
-        r.m[2][2] = (far + near) / (near - far);
-        r.m[2][3] = 2 * far * near / (near - far);
-        r.m[3][2] = -1;
-        return r;
-    }
-
-    pub fn lookAt(eye: Vec3, target: Vec3, world_up: Vec3) Mat4 {
-        const f = target.sub(eye).norm();
-        const r = f.cross(world_up).norm();
-        const u = r.cross(f);
-        var mat = identity;
-        mat.m[0] = .{ r.v[0], r.v[1], r.v[2], -r.dot(eye) };
-        mat.m[1] = .{ u.v[0], u.v[1], u.v[2], -u.dot(eye) };
-        mat.m[2] = .{ -f.v[0], -f.v[1], -f.v[2], f.dot(eye) };
-        return mat;
-    }
-
-    pub fn transpose(self: Mat4) Mat4 {
-        var r: Mat4 = undefined;
-        inline for (0..4) |i| inline for (0..4) |j| {
-            r.m[i][j] = self.m[j][i];
+    pub inline fn mulVec(m: Mat4, v: Vec3) @Vector(4, f32) {
+        return .{
+            m.data[0] * v.data[0] + m.data[4] * v.data[1] + m.data[8]  * v.data[2] + m.data[12],
+            m.data[1] * v.data[0] + m.data[5] * v.data[1] + m.data[9]  * v.data[2] + m.data[13],
+            m.data[2] * v.data[0] + m.data[6] * v.data[1] + m.data[10] * v.data[2] + m.data[14],
+            m.data[3] * v.data[0] + m.data[7] * v.data[1] + m.data[11] * v.data[2] + m.data[15],
         };
-        return r;
+    }
+
+    pub inline fn mulVec3(m: Mat4, v: Vec3) Vec3 {
+        const r = mulVec(m, v);
+        return Vec3.new(r[0], r[1], r[2]);
+    }
+
+    pub inline fn translate(v: Vec3) Mat4 {
+        return .{ .data = .{ 1, 0, 0, 0,  0, 1, 0, 0,  0, 0, 1, 0,  v.data[0], v.data[1], v.data[2], 1 } };
+    }
+
+    pub inline fn scaling(v: Vec3) Mat4 {
+        return .{ .data = .{ v.data[0], 0, 0, 0,  0, v.data[1], 0, 0,  0, 0, v.data[2], 0,  0, 0, 0, 1 } };
+    }
+
+    pub inline fn lookAt(eye: Vec3, center: Vec3, up: Vec3) Mat4 {
+        const f = center.sub(eye).normalize();
+        const s = f.cross(up).normalize();
+        const u = s.cross(f);
+        return .{ .data = .{
+            s.data[0],   u.data[0],   -f.data[0],  0,
+            s.data[1],   u.data[1],   -f.data[1],  0,
+            s.data[2],   u.data[2],   -f.data[2],  0,
+            -s.dot(eye), -u.dot(eye),  f.dot(eye),  1,
+        } };
+    }
+
+    /// Direct Euler → view matrix (single trig evaluation).
+    pub inline fn viewMatrix(pos: Vec3, yaw: f32, pitch: f32, eye_height: f32) Mat4 {
+        const eye = Vec3.add(pos, Vec3.new(0, eye_height, 0));
+        const cy = @cos(yaw);   const sy = @sin(yaw);
+        const cp = @cos(pitch); const sp = @sin(pitch);
+        return .{ .data = .{
+            cy,
+            sy * sp,
+            -sy * cp,
+            0,
+            0,
+            cp,
+            sp,
+            0,
+            sy,
+            -cy * sp,
+            cy * cp,
+            0,
+            -eye.data[0] * cy  - eye.data[2] * sy,
+            -eye.data[0] * sy * sp - eye.data[1] * cp + eye.data[2] * cy * sp,
+             eye.data[0] * sy * cp - eye.data[1] * sp - eye.data[2] * cy * cp,
+            1,
+        } };
     }
 };
+
+pub inline fn perspective(fov: f32, asp: f32, near: f32, far: f32) Mat4 {
+    const t = @tan(fov * std.math.pi / 360.0) * near;
+    const r = t * asp;
+    return .{ .data = .{
+        near / r, 0,        0,                          0,
+        0,        near / t, 0,                          0,
+        0,        0,        -(far + near) / (far - near), -1,
+        0,        0,        -(2 * far * near) / (far - near), 0,
+    } };
+}
+
+pub inline fn wishdir(fwd: f32, right: f32, yaw: f32) Vec3 {
+    const fwd_vec  = Vec3.new(@sin(yaw), 0, -@cos(yaw));
+    const side_vec = Vec3.new(@cos(yaw), 0,  @sin(yaw));
+    return Vec3.add(Vec3.scale(fwd_vec, fwd), Vec3.scale(side_vec, right));
+}

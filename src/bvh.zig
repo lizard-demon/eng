@@ -1,41 +1,30 @@
-//! bvh.zig — generic SAH-based BVH
-//!
-//! BVH(T) indexes any type T that has `pub fn bounds(self) AABB`.
-//! SAH construction · stack-based traversal · raycast + frustum queries.
-//!
-//!   const Tree = eng.BVH(MyCollider);
-//!   var tree = try Tree.init(&colliders, alloc);
-//!   const hit = tree.raycast(ray, 100, MyCollider.hitDist);
+//! bvh.zig — generic SAH BVH over any T with `pub fn bounds(self) AABB`
 
 const std = @import("std");
-const geo = @import("geo.zig");
-const AABB = geo.AABB;
+const math = @import("math.zig");
+const geo  = @import("geo.zig");
+const AABB = math.AABB;
+const Vec3 = math.Vec3;
 
 pub fn BVH(comptime T: type) type {
     if (!@hasDecl(T, "bounds"))
-        @compileError("BVH item type must expose `pub fn bounds(self) AABB`");
+        @compileError("BVH item must expose `pub fn bounds(self) AABB`");
 
     return struct {
         const Self = @This();
+
         pub const max_stack = 64;
-        const sah_bins = 8;
-        const leaf_max = 8;
-        const traverse_cost: f32 = 0.3;
+        const sah_bins  = 8;
+        const leaf_max  = 8;
+        const tcost: f32 = 0.3;
 
-        pub const Node = struct {
-            box: AABB,
-            /// Leaf: start index into `indices`.  Internal: right-child node index.
-            first: u32,
-            /// >0 → leaf item count.  0 → internal (left child = this+1).
-            count: u16,
-        };
+        pub const Node    = struct { box: AABB, first: u32, count: u16 };
+        pub const RayHit  = struct { index: u32, dist: f32 };
 
-        pub const RayHit = struct { index: u32, dist: f32 };
-
-        nodes: std.ArrayListUnmanaged(Node) = .{},
-        indices: std.ArrayListUnmanaged(u32) = .{},
-        items: []const T,
-        alloc: std.mem.Allocator,
+        nodes:   std.ArrayListUnmanaged(Node) = .{},
+        indices: std.ArrayListUnmanaged(u32)  = .{},
+        items:   []const T,
+        alloc:   std.mem.Allocator,
 
         // ── build ─────────────────────────────────────────────────
 
@@ -58,16 +47,17 @@ pub fn BVH(comptime T: type) type {
             for (start + 1..start + count) |i|
                 box = box.merge(self.items[self.indices.items[i]].bounds());
 
-            if (count <= leaf_max or self.findSplit(start, count, box) == null) {
+            const maybe_split = self.findSplit(start, count, box);
+            if (count <= leaf_max or maybe_split == null) {
                 try self.nodes.append(self.alloc, .{ .box = box, .first = start, .count = @intCast(count) });
                 return;
             }
-            const sp = self.findSplit(start, count, box).?;
+            const sp = maybe_split.?;
 
-            // Lomuto partition — simple, correct, branchless-friendly.
+            // Lomuto partition
             var lo = start;
             for (start..start + count) |i| {
-                if (self.items[self.indices.items[i]].bounds().center().v[sp.axis] < sp.pos) {
+                if (self.items[self.indices.items[i]].bounds().center().data[sp.axis] < sp.pos) {
                     std.mem.swap(u32, &self.indices.items[lo], &self.indices.items[i]);
                     lo += 1;
                 }
@@ -77,44 +67,43 @@ pub fn BVH(comptime T: type) type {
                 return;
             }
 
+            // Internal node: left child is immediately next (ni+1), right is node.first.
             const ni = self.nodes.items.len;
             try self.nodes.append(self.alloc, .{ .box = box, .first = 0, .count = 0 });
-            try self.buildNode(start, lo - start); // left child → ni+1
-            self.nodes.items[ni].first = @intCast(self.nodes.items.len); // right child
+            try self.buildNode(start, lo - start);
+            self.nodes.items[ni].first = @intCast(self.nodes.items.len);
             try self.buildNode(lo, start + count - lo);
         }
 
         const Split = struct { axis: u32, pos: f32 };
 
         fn findSplit(self: *Self, start: u32, count: u32, box: AABB) ?Split {
-            const pa = box.halfArea();
+            const pa = box.surfaceArea();
             if (pa <= 0) return null;
-            var best_cost: f32 = @as(f32, @floatFromInt(count));
+            var best_cost: f32 = @floatFromInt(count);
             var best: ?Split = null;
             for (0..3) |axis| {
-                const range = box.max.v[axis] - box.min.v[axis];
-                if (range <= 1e-6) continue;
-                const step = range / @as(f32, @floatFromInt(sah_bins));
+                const rng = box.hi.data[axis] - box.lo.data[axis];
+                if (rng <= 1e-6) continue;
+                const step = rng / @as(f32, @floatFromInt(sah_bins));
                 for (0..sah_bins) |bin| {
-                    const pos = box.min.v[axis] + step * (@as(f32, @floatFromInt(bin)) + 0.5);
-                    var lb = AABB{};
+                    const pos = box.lo.data[axis] + step * (@as(f32, @floatFromInt(bin)) + 0.5);
+                    var lb = AABB.empty;
+                    var rb = AABB.empty;
                     var lc: u32 = 0;
-                    var rb = AABB{};
                     var rc: u32 = 0;
                     for (start..start + count) |i| {
                         const ib = self.items[self.indices.items[i]].bounds();
-                        if (ib.center().v[axis] < pos) {
-                            lb = lb.merge(ib);
-                            lc += 1;
+                        if (ib.center().data[axis] < pos) {
+                            lb = lb.merge(ib); lc += 1;
                         } else {
-                            rb = rb.merge(ib);
-                            rc += 1;
+                            rb = rb.merge(ib); rc += 1;
                         }
                     }
                     if (lc == 0 or rc == 0) continue;
-                    const cost = traverse_cost +
-                        (lb.halfArea() / pa) * @as(f32, @floatFromInt(lc)) +
-                        (rb.halfArea() / pa) * @as(f32, @floatFromInt(rc));
+                    const cost = tcost
+                        + (lb.surfaceArea() / pa) * @as(f32, @floatFromInt(lc))
+                        + (rb.surfaceArea() / pa) * @as(f32, @floatFromInt(rc));
                     if (cost < best_cost) {
                         best_cost = cost;
                         best = .{ .axis = @intCast(axis), .pos = pos };
@@ -126,7 +115,7 @@ pub fn BVH(comptime T: type) type {
 
         // ── queries ───────────────────────────────────────────────
 
-        /// Find closest ray hit.  `hitFn(item, Ray, max_t) -> ?f32`.
+        /// Closest ray hit.  `hitFn(item, Ray, max_t) -> ?f32`.
         pub fn raycast(
             self: *const Self,
             ray: geo.Ray,
@@ -142,21 +131,23 @@ pub fn BVH(comptime T: type) type {
             while (sp > 0) {
                 sp -= 1;
                 const ni = stack[sp];
+                if (ni >= self.nodes.items.len) continue;
                 const node = self.nodes.items[ni];
                 if (ray.hitAABB(node.box, best_t) == null) continue;
                 if (node.count > 0) {
                     for (node.first..node.first + node.count) |i| {
-                        if (hitFn(self.items[self.indices.items[i]], ray, best_t)) |t| {
+                        const idx = self.indices.items[i];
+                        if (hitFn(self.items[idx], ray, best_t)) |t| {
                             if (t < best_t) {
                                 best_t = t;
-                                best = .{ .index = self.indices.items[i], .dist = t };
+                                best = .{ .index = idx, .dist = t };
                             }
                         }
                     }
                 } else if (sp + 2 <= max_stack) {
-                    stack[sp] = @intCast(ni + 1);
+                    stack[sp] = @intCast(ni + 1); // left child (adjacent)
                     sp += 1;
-                    stack[sp] = node.first;
+                    stack[sp] = node.first;       // right child
                     sp += 1;
                 }
             }
@@ -165,10 +156,10 @@ pub fn BVH(comptime T: type) type {
 
         /// Lazy frustum-query iterator — yields item indices inside the frustum.
         pub const FrustumIter = struct {
-            bvh: *const Self,
-            fr: geo.Frustum,
-            stack: [max_stack]u32 = undefined,
-            sp: u32 = 0,
+            bvh:      *const Self,
+            fr:       geo.Frustum,
+            stack:    [max_stack]u32 = undefined,
+            sp:       u32 = 0,
             leaf_cur: u32 = 0,
             leaf_end: u32 = 0,
 
@@ -182,6 +173,7 @@ pub fn BVH(comptime T: type) type {
                     if (self.sp == 0) return null;
                     self.sp -= 1;
                     const ni = self.stack[self.sp];
+                    if (ni >= self.bvh.nodes.items.len) continue;
                     const node = self.bvh.nodes.items[ni];
                     if (!self.fr.containsAABB(node.box)) continue;
                     if (node.count > 0) {
@@ -199,10 +191,7 @@ pub fn BVH(comptime T: type) type {
 
         pub fn queryFrustum(self: *const Self, fr: geo.Frustum) FrustumIter {
             var it = FrustumIter{ .bvh = self, .fr = fr };
-            if (self.nodes.items.len > 0) {
-                it.stack[0] = 0;
-                it.sp = 1;
-            }
+            if (self.nodes.items.len > 0) { it.stack[0] = 0; it.sp = 1; }
             return it;
         }
     };

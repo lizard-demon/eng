@@ -1,9 +1,5 @@
-//! main.zig — FPS walker demo
-//!
-//! Shows every framework module working together:
-//!   math · geo · BVH · phys · gfx.Renderer · Pool
-//! All wired through comptime generics, zero vtables.
-//
+//! main.zig — FPS walker demo (SDL3 GPU · BVH · Quake physics)
+
 const std = @import("std");
 const sdl = @import("sdl3");
 const eng = @import("engine");
@@ -12,32 +8,31 @@ const gpu_mod = @import("gpu_sdl3");
 const Vec3 = eng.Vec3;
 const Mat4 = eng.Mat4;
 const AABB = eng.AABB;
-const Ray = eng.Ray;
+const Ray  = eng.Ray;
 
-// ── types ─────────────────────────────────────────────────────────
-
-const Gpu = gpu_mod.Gpu;
-const Ren = eng.Renderer(Gpu); // comptime-monomorphised 3D renderer
+const GpuBackend = gpu_mod.Gpu;
+const Ren        = eng.Renderer(GpuBackend);
 
 const Player = eng.Body(.{
-    .gravity = 12.0,
-    .jump_speed = 5.0,
-    .max_speed = 5.5,
-    .air_speed = 1.0,
-    .accel = 55.0,
-    .friction = 6.0,
-    .margin = 0.02,
+    .gravity     = 12.0,
+    .jump_speed  = 5.0,
+    .max_speed   = 5.5,
+    .air_speed   = 1.0,
+    .accel       = 55.0,
+    .friction    = 6.0,
+    .margin      = 0.02,
     .slope_limit = 0.707,
-    .max_slides = 4,
-    .radius = 0.3,
+    .max_slides  = 4,
+    .radius      = 0.3,
+    .eye_height  = 0.6,
 });
 
-// ── level geometry ────────────────────────────────────────────────
+// ── Level brushes ─────────────────────────────────────────────────
 
 const Brush = struct {
-    aabb: AABB,
-    expanded: AABB, // padded by player radius for swept-sphere collision
-    color: [4]f32,
+    aabb:     AABB,
+    expanded: AABB,
+    color:    [4]f32,
 
     pub fn bounds(self: Brush) AABB { return self.expanded; }
 
@@ -47,51 +42,54 @@ const Brush = struct {
 
     pub fn hitNormal(self: Brush, ray: Ray, t: f32) eng.phys.Hit {
         const p = ray.at(t);
-        var best_n = Vec3.zero;
+        var best_n = Vec3.zero();
         var best_d: f32 = std.math.floatMax(f32);
         for (0..3) |i| {
-            const dlo = @abs(p.v[i] - self.expanded.min.v[i]);
+            const dlo = @abs(p.data[i] - self.expanded.lo.data[i]);
             if (dlo < best_d) {
-                best_d = dlo;
-                best_n = Vec3.zero;
-                best_n.v[i] = -1;
+                best_d         = dlo;
+                best_n         = Vec3.zero();
+                best_n.data[i] = -1;
             }
-            const dhi = @abs(p.v[i] - self.expanded.max.v[i]);
+            const dhi = @abs(p.data[i] - self.expanded.hi.data[i]);
             if (dhi < best_d) {
-                best_d = dhi;
-                best_n = Vec3.zero;
-                best_n.v[i] = 1;
+                best_d         = dhi;
+                best_n         = Vec3.zero();
+                best_n.data[i] = 1;
             }
         }
         return .{ .normal = best_n, .dist = t };
     }
 };
 
-fn brush(lo: [3]f32, hi: [3]f32, color: [4]f32) Brush {
-    const a = AABB.init(Vec3{ .v = lo }, Vec3{ .v = hi });
-    return .{ .aabb = a, .expanded = a.pad(0.3), .color = color };
+fn mkBrush(lo: [3]f32, hi: [3]f32, col: [4]f32) Brush {
+    const a = AABB.new(
+        Vec3{ .data = .{ lo[0], lo[1], lo[2] } },
+        Vec3{ .data = .{ hi[0], hi[1], hi[2] } },
+    );
+    return .{ .aabb = a, .expanded = a.pad(0.3), .color = col };
 }
 
-const W = [4]f32{ 0.50, 0.44, 0.38, 1 }; // walls
-const F = [4]f32{ 0.30, 0.34, 0.30, 1 }; // floor
-const P = [4]f32{ 0.60, 0.52, 0.42, 1 }; // pillars
-const C = [4]f32{ 0.42, 0.42, 0.50, 1 }; // center
+const W = [4]f32{ 0.50, 0.44, 0.38, 1 };
+const F = [4]f32{ 0.30, 0.34, 0.30, 1 };
+const P = [4]f32{ 0.60, 0.52, 0.42, 1 };
+const C = [4]f32{ 0.42, 0.42, 0.50, 1 };
 
 const level = [_]Brush{
-    brush(.{ -15, -0.5, -15 }, .{ 15, 0, 15 }, F), // floor
-    brush(.{ -15, 0, -15 }, .{ -14, 3, 15 }, W), // L wall
-    brush(.{ 14, 0, -15 }, .{ 15, 3, 15 }, W), // R wall
-    brush(.{ -15, 0, -15 }, .{ 15, 3, -14 }, W), // back wall
-    brush(.{ -15, 0, 14 }, .{ 15, 3, 15 }, W), // front wall
-    brush(.{ -5, 0, -5 }, .{ -4, 2.5, -4 }, P),
-    brush(.{ 4, 0, -5 }, .{ 5, 2.5, -4 }, P),
-    brush(.{ -5, 0, 4 }, .{ -4, 2.5, 5 }, P),
-    brush(.{ 4, 0, 4 }, .{ 5, 2.5, 5 }, P),
-    brush(.{ -2, 0, -2 }, .{ 2, 1, 2 }, C), // center block
-    brush(.{ -1, 1, -1 }, .{ 1, 1.6, 1 }, C), // top tier
+    mkBrush(.{ -15, -0.5, -15 }, .{  15,  0,   15  }, F),
+    mkBrush(.{ -15,  0,  -15  }, .{ -14,  3,   15  }, W),
+    mkBrush(.{  14,  0,  -15  }, .{  15,  3,   15  }, W),
+    mkBrush(.{ -15,  0,  -15  }, .{  15,  3,  -14  }, W),
+    mkBrush(.{ -15,  0,   14  }, .{  15,  3,   15  }, W),
+    mkBrush(.{  -5,  0,   -5  }, .{  -4,  2.5, -4  }, P),
+    mkBrush(.{   4,  0,   -5  }, .{   5,  2.5, -4  }, P),
+    mkBrush(.{  -5,  0,    4  }, .{  -4,  2.5,  5  }, P),
+    mkBrush(.{   4,  0,    4  }, .{   5,  2.5,  5  }, P),
+    mkBrush(.{  -2,  0,   -2  }, .{   2,  1,    2  }, C),
+    mkBrush(.{  -1,  1,   -1  }, .{   1,  1.6,  1  }, C),
 };
 
-// ── physics world adapter (fulfils Body's anytype contract) ───────
+// ── Physics world adapter ─────────────────────────────────────────
 
 const World = struct {
     tree: *const eng.BVH(Brush),
@@ -104,7 +102,7 @@ const World = struct {
     }
 };
 
-// ── entry ─────────────────────────────────────────────────────────
+// ── Entry ─────────────────────────────────────────────────────────
 
 const win_w: i32 = 1280;
 const win_h: i32 = 720;
@@ -116,94 +114,112 @@ pub fn main() !void {
     try sdl.init(.{ .video = true, .events = true });
     defer sdl.quit(.{ .video = true, .events = true });
 
-    const win = try sdl.video.Window.init("Engine Demo — WASD+Mouse+Space", win_w, win_h, .{});
+    const win = try sdl.video.Window.init(
+        "Engine Demo — click to capture mouse, ESC to release",
+        win_w, win_h, .{},
+    );
     defer win.deinit();
-    const ren = try sdl.render.Renderer.init(win, null);
-    defer ren.deinit();
 
-    // BVH
+    const device = try sdl.gpu.Device.init(.{ .spirv = true }, true, null);
+
     var tree = try eng.BVH(Brush).init(&level, alloc);
     defer tree.deinit();
 
-    // GPU + Renderer
-    var renderer = Ren.init(Gpu.init(ren, @floatFromInt(win_w), @floatFromInt(win_h), alloc));
+    var renderer = Ren.init(try GpuBackend.init(device, win, alloc));
     defer renderer.gpu.deinit();
 
-    // Upload one mesh per brush (individual colors)
-    var handles: [level.len]Gpu.Handle = undefined;
-    for (level, 0..) |b, i| {
-        var bm = gpu_mod.boxMesh(b.aabb);
-        handles[i] = try renderer.upload(&bm.pos, &bm.nrm, &bm.idx);
+    // ── Build geometry ────────────────────────────────────────────
+    var all_verts   = std.ArrayListUnmanaged(eng.Vertex){};
+    defer all_verts.deinit(alloc);
+    var all_indices = std.ArrayListUnmanaged(u32){};
+    defer all_indices.deinit(alloc);
+
+    for (level) |b| {
+        const bm   = gpu_mod.boxVertices(b.aabb, b.color);
+        const base: u32 = @intCast(all_verts.items.len);
+        try all_verts.appendSlice(alloc, &bm.verts);
+        for (bm.indices) |idx| try all_indices.append(alloc, base + idx);
     }
 
-    // Player + world
-    var player = Player{ .pos = Vec3.init(0, 3, 0) };
-    const world = World{ .tree = &tree, .data = &level };
+    const handle = try renderer.upload(
+        std.mem.sliceAsBytes(all_verts.items),
+        @sizeOf(eng.Vertex),
+        std.mem.sliceAsBytes(all_indices.items),
+        @intCast(all_indices.items.len),
+    );
 
-    sdl.mouse.hide() catch {};
+    var level_aabb = level[0].aabb;
+    for (level[1..]) |b| level_aabb = level_aabb.merge(b.aabb);
 
-    var last_mx: f32 = @as(f32, @floatFromInt(@divTrunc(win_w, 2)));
-    var last_my: f32 = @as(f32, @floatFromInt(@divTrunc(win_h, 2)));
-    var running = true;
+    // ── Game state ────────────────────────────────────────────────
+    var player       = Player{ .pos = Vec3.new(0, 1.5, -8) };
+    const world      = World{ .tree = &tree, .data = &level };
+    var mouse_locked = false;
+    var running      = true;
 
     while (running) {
-        // ── events ───────────────────────────────────────────────
+        var mdx: f32 = 0;
+        var mdy: f32 = 0;
+
+        // ── Events ───────────────────────────────────────────────
         while (sdl.events.poll()) |ev| {
             switch (ev) {
                 .quit => running = false,
+
+                .key_down => |k| {
+                    if (k.scancode) |sc| {
+                        if (sc == .escape and mouse_locked) {
+                            mouse_locked = false;
+                            sdl.mouse.show()                            catch {};
+                            sdl.mouse.setWindowRelativeMode(win, false) catch {};
+                        }
+                        if (sc == .escape and !mouse_locked) running = false;
+                    }
+                },
+
+                .mouse_button_down => |m| {
+                    if (m.button == .left and !mouse_locked) {
+                        mouse_locked = true;
+                        sdl.mouse.hide()                           catch {};
+                        sdl.mouse.setWindowRelativeMode(win, true) catch {};
+                    }
+                },
+
+                .mouse_motion => |m| {
+                    // SDL3 Zig binding: xrel/yrel → x_rel/y_rel
+                    if (mouse_locked) { mdx += m.x_rel; mdy += m.y_rel; }
+                },
+
                 else => {},
             }
         }
 
-        // ── mouse look (poll + warp-to-center) ──────────────────
-        _, const mx, const my = sdl.mouse.getState();
-        const cx: f32 = @as(f32, @floatFromInt(@divTrunc(win_w, 2)));
-        const cy: f32 = @as(f32, @floatFromInt(@divTrunc(win_h, 2)));
-        player.yaw += (mx - last_mx) * 0.003;
-        player.pitch = std.math.clamp(player.pitch - (my - last_my) * 0.003, -1.5, 1.5);
-        last_mx = mx;
-        last_my = my;
-        // Warp cursor back near center to prevent edge-lock
-        if (@abs(mx - cx) > 200 or @abs(my - cy) > 150) {
-            sdl.mouse.warpInWindow(win, cx, cy);
-            last_mx = cx;
-            last_my = cy;
+        // ── Look ─────────────────────────────────────────────────
+        if (mouse_locked) {
+            player.yaw  += mdx * 0.002;
+            player.pitch = std.math.clamp(player.pitch + mdy * 0.002, -1.5, 1.5);
         }
 
-        // ── input ────────────────────────────────────────────────
-        const keys = sdl.keyboard.getState();
-        const sc = sdl.Scancode;
-        const fwd: f32 = if (keys[@intFromEnum(sc.w)]) 1 else if (keys[@intFromEnum(sc.s)]) -1 else 0;
-        const rgt: f32 = if (keys[@intFromEnum(sc.d)]) 1 else if (keys[@intFromEnum(sc.a)]) -1 else 0;
-        const jump = keys[@intFromEnum(sc.space)];
-        if (keys[@intFromEnum(sc.escape)]) running = false;
+        // ── Input ────────────────────────────────────────────────
+        const keys    = sdl.keyboard.getState();
+        const sc      = sdl.Scancode;
+        const fwd_in: f32 = if (keys[@intFromEnum(sc.w)]) 1 else if (keys[@intFromEnum(sc.s)]) -1 else 0;
+        const rgt_in: f32 = if (keys[@intFromEnum(sc.d)]) 1 else if (keys[@intFromEnum(sc.a)]) -1 else 0;
+        const jump        = keys[@intFromEnum(sc.space)];
 
-        // ── physics ──────────────────────────────────────────────
-        const dt: f32 = 1.0 / 60.0; // vsync assumed; swap for real timing
-        player.step(world, player.wishDir(fwd, rgt), jump, dt);
+        // ── Physics ──────────────────────────────────────────────
+        const dt: f32 = 1.0 / 60.0;
+        player.step(world, eng.wishdir(fwd_in, rgt_in, player.yaw), jump, dt);
 
-        // ── render ───────────────────────────────────────────────
-        renderer.clear(.{ 0.06, 0.07, 0.12, 1 });
-
-        const eye = player.eyePos();
-        const look = player.lookDir();
-        renderer.camera(eye, eye.add(look), Vec3.up, 1.22, //
-            @as(f32, @floatFromInt(win_w)) / @as(f32, @floatFromInt(win_h)), 0.1, 100);
-
-        // Frustum-culled draw via BVH iterator
-        var query = tree.queryFrustum(renderer.frust);
-        while (query.next()) |idx| {
-            renderer.gpu.draw(handles[idx], Mat4.identity, level[idx].color);
+        // ── Render ───────────────────────────────────────────────
+        if (try renderer.beginFrame()) {
+            const aspect = @as(f32, @floatFromInt(win_w)) / @as(f32, @floatFromInt(win_h));
+            renderer.cameraEuler(
+                player.pos, player.yaw, player.pitch, 0.6,
+                90.0, aspect, 0.1, 100.0,
+            );
+            renderer.draw(handle, Mat4.identity(), level_aabb, .{ 1, 1, 1, 1 });
+            try renderer.endFrame();
         }
-
-        // Crosshair
-        const cw = sdl.pixels.Color{ .r = 200, .g = 200, .b = 200, .a = 180 };
-        ren.setDrawColor(cw) catch {};
-        ren.renderLine(.{ .x = cx - 10, .y = cy }, .{ .x = cx - 4, .y = cy }) catch {};
-        ren.renderLine(.{ .x = cx + 4, .y = cy }, .{ .x = cx + 10, .y = cy }) catch {};
-        ren.renderLine(.{ .x = cx, .y = cy - 10 }, .{ .x = cx, .y = cy - 4 }) catch {};
-        ren.renderLine(.{ .x = cx, .y = cy + 4 }, .{ .x = cx, .y = cy + 10 }) catch {};
-
-        ren.present() catch {};
     }
 }
