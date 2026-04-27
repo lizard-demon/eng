@@ -1,48 +1,37 @@
 //! gpu_sdl3.zig — SDL3 GPU backend fulfilling gfx.Renderer(Gpu) contract
-
 const std = @import("std");
 const sdl = @import("sdl3");
 const gpu = sdl.gpu;
 const eng = @import("engine");
 const Mat4 = eng.Mat4;
-
 const vert_spv = @embedFile("shaders/triangle.vert.spv");
 const frag_spv = @embedFile("shaders/triangle.frag.spv");
-
 const MeshInfo = struct { idx_offset: u32, idx_count: u32, vtx_offset: i32 };
-
 pub const Gpu = struct {
     pub const Handle = u32;
-
     device:        gpu.Device,
     window:        sdl.video.Window,
     pipeline:      gpu.GraphicsPipeline,
     depth_tex:     ?gpu.Texture = null,
     width:         u32 = 0,
     height:        u32 = 0,
-
     vbo:    ?gpu.Buffer = null,
     ibo:    ?gpu.Buffer = null,
     meshes: std.ArrayListUnmanaged(MeshInfo) = .{},
     alloc:  std.mem.Allocator,
-
     cmd:           ?gpu.CommandBuffer = null,
     render_pass:   ?gpu.RenderPass    = null,
     swapchain_tex: ?gpu.Texture       = null,
-
     // ── init ──────────────────────────────────────────────────────
-
     pub fn init(device: gpu.Device, window: sdl.video.Window, alloc: std.mem.Allocator) !Gpu {
         try device.claimWindow(window);
         const sc_fmt = try device.getSwapchainTextureFormat(window);
-
         const depth_fmt: gpu.TextureFormat =
             if (device.textureSupportsFormat(
                     .depth32_float, .two_dimensional, .{ .depth_stencil_target = true }))
                 .depth32_float
             else
                 .depth16_unorm;
-
         const vert_shader = try device.createShader(.{
             .code                = vert_spv,
             .entry_point         = "main",
@@ -51,7 +40,6 @@ pub const Gpu = struct {
             .num_uniform_buffers = 1,
         });
         defer device.releaseShader(vert_shader);
-
         const frag_shader = try device.createShader(.{
             .code        = frag_spv,
             .entry_point = "main",
@@ -59,7 +47,6 @@ pub const Gpu = struct {
             .stage       = .fragment,
         });
         defer device.releaseShader(frag_shader);
-
         const pipeline = try device.createGraphicsPipeline(.{
             .vertex_shader   = vert_shader,
             .fragment_shader = frag_shader,
@@ -90,7 +77,6 @@ pub const Gpu = struct {
                 .depth_stencil_format      = depth_fmt,
             },
         });
-
         return .{
             .device   = device,
             .window   = window,
@@ -98,9 +84,7 @@ pub const Gpu = struct {
             .alloc    = alloc,
         };
     }
-
     // ── deinit ────────────────────────────────────────────────────
-
     pub fn deinit(self: *Gpu) void {
         self.device.waitForIdle() catch {};
         self.meshes.deinit(self.alloc);
@@ -111,11 +95,7 @@ pub const Gpu = struct {
         self.device.releaseWindow(self.window);
         self.device.deinit();
     }
-
     // ── helpers ───────────────────────────────────────────────────
-
-    /// Create a depth texture.  layer_count_or_depth and num_levels must
-    /// be >= 1 — SDL3 asserts on 0.
     fn makeDepthTexture(self: *Gpu, w: u32, h: u32) !gpu.Texture {
         const depth_fmt: gpu.TextureFormat =
             if (self.device.textureSupportsFormat(
@@ -132,7 +112,6 @@ pub const Gpu = struct {
             .num_levels           = 1,
         });
     }
-
     fn uploadBuffer(device: gpu.Device, data: []const u8, usage: gpu.BufferUsageFlags) !gpu.Buffer {
         const sz: u32 = @intCast(data.len);
         const buf  = try device.createBuffer(.{ .usage = usage, .size = sz });
@@ -140,7 +119,6 @@ pub const Gpu = struct {
         const ptr  = try device.mapTransferBuffer(tbuf, false);
         @memcpy(ptr[0..data.len], data);
         device.unmapTransferBuffer(tbuf);
-
         const cmd  = try device.acquireCommandBuffer();
         const copy = cmd.beginCopyPass();
         copy.uploadToBuffer(
@@ -154,9 +132,7 @@ pub const Gpu = struct {
         device.releaseTransferBuffer(tbuf);
         return buf;
     }
-
     // ── Contract methods ──────────────────────────────────────────
-
     pub fn upload(
         self:       *Gpu,
         vert_bytes: []const u8,
@@ -179,23 +155,41 @@ pub const Gpu = struct {
         });
         return h;
     }
-
+    /// Hot-swap buffers for an existing handle (editor mesh rebuild).
+    /// Call **between** frames (after endFrame, before beginFrame).
+    pub fn updateMesh(
+        self:       *Gpu,
+        handle:     Handle,
+        vert_bytes: []const u8,
+        idx_bytes:  []const u8,
+        i_count:    u32,
+    ) !void {
+        const vb = try uploadBuffer(self.device, vert_bytes, .{ .vertex = true });
+        const ib = try uploadBuffer(self.device, idx_bytes,  .{ .index  = true });
+        if (self.vbo) |old| self.device.releaseBuffer(old);
+        if (self.ibo) |old| self.device.releaseBuffer(old);
+        self.vbo = vb;
+        self.ibo = ib;
+        if (handle < self.meshes.items.len) {
+            self.meshes.items[handle] = .{
+                .idx_offset = 0,
+                .idx_count  = i_count,
+                .vtx_offset = 0,
+            };
+        }
+    }
     pub fn release(self: *Gpu, _: Handle) void { _ = self; }
-
     pub fn beginFrame(self: *Gpu) !bool {
         self.cmd = try self.device.acquireCommandBuffer();
         const tex, const w, const h =
             try self.cmd.?.waitAndAcquireSwapchainTexture(self.window);
         self.swapchain_tex = tex orelse return false;
-
-        // Recreate depth texture whenever the window is resized.
         if (w != self.width or h != self.height or self.depth_tex == null) {
             self.width  = w;
             self.height = h;
             if (self.depth_tex) |dt| self.device.releaseTexture(dt);
             self.depth_tex = try self.makeDepthTexture(w, h);
         }
-
         self.render_pass = self.cmd.?.beginRenderPass(
             &.{gpu.ColorTargetInfo{
                 .texture     = self.swapchain_tex.?,
@@ -214,21 +208,18 @@ pub const Gpu = struct {
                 .clear_stencil = 0,
             },
         );
-
         const rp = self.render_pass.?;
         rp.bindGraphicsPipeline(self.pipeline);
         if (self.vbo) |vb| rp.bindVertexBuffers(0, &.{.{ .buffer = vb, .offset = 0 }});
         if (self.ibo) |ib| rp.bindIndexBuffer(.{ .buffer = ib, .offset = 0 }, .indices_32bit);
         return true;
     }
-
     pub fn endFrame(self: *Gpu) !void {
         if (self.render_pass) |rp| rp.end();
         self.render_pass = null;
         if (self.cmd) |cmd| try cmd.submit();
         self.cmd = null;
     }
-
     pub fn draw(self: *Gpu, handle: Handle, mvp: Mat4, color: [4]f32) void {
         _ = color;
         if (handle >= self.meshes.items.len) return;
@@ -239,9 +230,7 @@ pub const Gpu = struct {
         rp.drawIndexedPrimitives(info.idx_count, 1, info.idx_offset, info.vtx_offset, 0);
     }
 };
-
-// ── Box mesh helper ───────────────────────────────────────────────
-
+// ── Box mesh helper (retained for utility) ────────────────────────
 pub fn boxVertices(aabb: eng.AABB, color: [4]f32) struct {
     verts:   [24]eng.Vertex,
     indices: [36]u32,
@@ -249,12 +238,12 @@ pub fn boxVertices(aabb: eng.AABB, color: [4]f32) struct {
     const mn = aabb.lo.data;
     const mx = aabb.hi.data;
     const uv = [24][3]f32{
-        .{ 0, 0, 0 }, .{ 1, 0, 0 }, .{ 1, 0, 1 }, .{ 0, 0, 1 }, // -Y
-        .{ 0, 1, 0 }, .{ 0, 1, 1 }, .{ 1, 1, 1 }, .{ 1, 1, 0 }, // +Y
-        .{ 0, 0, 1 }, .{ 1, 0, 1 }, .{ 1, 1, 1 }, .{ 0, 1, 1 }, // +Z
-        .{ 1, 0, 0 }, .{ 0, 0, 0 }, .{ 0, 1, 0 }, .{ 1, 1, 0 }, // -Z
-        .{ 0, 0, 0 }, .{ 0, 0, 1 }, .{ 0, 1, 1 }, .{ 0, 1, 0 }, // -X
-        .{ 1, 0, 1 }, .{ 1, 0, 0 }, .{ 1, 1, 0 }, .{ 1, 1, 1 }, // +X
+        .{ 0, 0, 0 }, .{ 1, 0, 0 }, .{ 1, 0, 1 }, .{ 0, 0, 1 },
+        .{ 0, 1, 0 }, .{ 0, 1, 1 }, .{ 1, 1, 1 }, .{ 1, 1, 0 },
+        .{ 0, 0, 1 }, .{ 1, 0, 1 }, .{ 1, 1, 1 }, .{ 0, 1, 1 },
+        .{ 1, 0, 0 }, .{ 0, 0, 0 }, .{ 0, 1, 0 }, .{ 1, 1, 0 },
+        .{ 0, 0, 0 }, .{ 0, 0, 1 }, .{ 0, 1, 1 }, .{ 0, 1, 0 },
+        .{ 1, 0, 1 }, .{ 1, 0, 0 }, .{ 1, 1, 0 }, .{ 1, 1, 1 },
     };
     var verts: [24]eng.Vertex = undefined;
     for (0..24) |i| {

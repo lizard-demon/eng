@@ -1,17 +1,13 @@
-//! main.zig — FPS walker demo (SDL3 GPU · BVH · Quake physics)
-
+//! main.zig — FPS walker + runtime BSP editor (SDL3 GPU · exact plane collision)
 const std = @import("std");
 const sdl = @import("sdl3");
 const eng = @import("engine");
 const gpu_mod = @import("gpu_sdl3");
-
 const Vec3 = eng.Vec3;
 const Mat4 = eng.Mat4;
-const AABB = eng.AABB;
-const Ray  = eng.Ray;
-
+const Bsp = eng.Bsp;
 const GpuBackend = gpu_mod.Gpu;
-const Ren        = eng.Renderer(GpuBackend);
+const Ren = eng.Renderer(GpuBackend);
 
 const Player = eng.Body(.{
     .gravity     = 12.0,
@@ -27,83 +23,37 @@ const Player = eng.Body(.{
     .eye_height  = 0.6,
 });
 
-// ── Level brushes ─────────────────────────────────────────────────
-
-const Brush = struct {
-    aabb:     AABB,
-    expanded: AABB,
-    color:    [4]f32,
-
-    pub fn bounds(self: Brush) AABB { return self.expanded; }
-
-    pub fn hitDist(self: Brush, ray: Ray, max_t: f32) ?f32 {
-        return ray.hitAABB(self.expanded, max_t);
-    }
-
-    pub fn hitNormal(self: Brush, ray: Ray, t: f32) eng.phys.Hit {
-        const p = ray.at(t);
-        var best_n = Vec3.zero();
-        var best_d: f32 = std.math.floatMax(f32);
-        for (0..3) |i| {
-            const dlo = @abs(p.data[i] - self.expanded.lo.data[i]);
-            if (dlo < best_d) {
-                best_d         = dlo;
-                best_n         = Vec3.zero();
-                best_n.data[i] = -1;
-            }
-            const dhi = @abs(p.data[i] - self.expanded.hi.data[i]);
-            if (dhi < best_d) {
-                best_d         = dhi;
-                best_n         = Vec3.zero();
-                best_n.data[i] = 1;
-            }
-        }
-        return .{ .normal = best_n, .dist = t };
+// ── BSP physics adapter (duck-types for Body.step) ────────────────
+const World = struct {
+    bsp: *const Bsp,
+    radius: f32,
+    pub fn cast(self: World, origin: Vec3, dir: Vec3, max_d: f32) ?eng.phys.Hit {
+        const r = self.bsp.trace(origin, dir, max_d, self.radius) orelse return null;
+        return .{ .normal = r.normal, .dist = r.dist };
     }
 };
 
-fn mkBrush(lo: [3]f32, hi: [3]f32, col: [4]f32) Brush {
-    const a = AABB.new(
-        Vec3{ .data = .{ lo[0], lo[1], lo[2] } },
-        Vec3{ .data = .{ hi[0], hi[1], hi[2] } },
+// ── Editor state ──────────────────────────────────────────────────
+const Editor = struct {
+    active: bool = false,
+    placing: bool = false,
+    anchor: Vec3 = Vec3.zero(),
+    grid_size: f32 = 1.0,
+    angle_step: f32 = std.math.pi / 12.0, // 15°
+};
+
+fn snapToGrid(v: Vec3, s: f32) Vec3 {
+    return Vec3.new(
+        @round(v.data[0] / s) * s,
+        @round(v.data[1] / s) * s,
+        @round(v.data[2] / s) * s,
     );
-    return .{ .aabb = a, .expanded = a.pad(0.3), .color = col };
+}
+fn snapAngle(a: f32, step: f32) f32 {
+    return @round(a / step) * step;
 }
 
-const W = [4]f32{ 0.50, 0.44, 0.38, 1 };
-const F = [4]f32{ 0.30, 0.34, 0.30, 1 };
-const P = [4]f32{ 0.60, 0.52, 0.42, 1 };
-const C = [4]f32{ 0.42, 0.42, 0.50, 1 };
-
-const level = [_]Brush{
-    mkBrush(.{ -15, -0.5, -15 }, .{  15,  0,   15  }, F),
-    mkBrush(.{ -15,  0,  -15  }, .{ -14,  3,   15  }, W),
-    mkBrush(.{  14,  0,  -15  }, .{  15,  3,   15  }, W),
-    mkBrush(.{ -15,  0,  -15  }, .{  15,  3,  -14  }, W),
-    mkBrush(.{ -15,  0,   14  }, .{  15,  3,   15  }, W),
-    mkBrush(.{  -5,  0,   -5  }, .{  -4,  2.5, -4  }, P),
-    mkBrush(.{   4,  0,   -5  }, .{   5,  2.5, -4  }, P),
-    mkBrush(.{  -5,  0,    4  }, .{  -4,  2.5,  5  }, P),
-    mkBrush(.{   4,  0,    4  }, .{   5,  2.5,  5  }, P),
-    mkBrush(.{  -2,  0,   -2  }, .{   2,  1,    2  }, C),
-    mkBrush(.{  -1,  1,   -1  }, .{   1,  1.6,  1  }, C),
-};
-
-// ── Physics world adapter ─────────────────────────────────────────
-
-const World = struct {
-    tree: *const eng.BVH(Brush),
-    data: []const Brush,
-
-    pub fn cast(self: World, origin: Vec3, dir: Vec3, max_d: f32) ?eng.phys.Hit {
-        const ray = Ray{ .origin = origin, .dir = dir };
-        const hit = self.tree.raycast(ray, max_d, Brush.hitDist) orelse return null;
-        return self.data[hit.index].hitNormal(ray, hit.dist);
-    }
-};
-
 // ── Entry ─────────────────────────────────────────────────────────
-
 const win_w: i32 = 1280;
 const win_h: i32 = 720;
 
@@ -115,78 +65,125 @@ pub fn main() !void {
     defer sdl.quit(.{ .video = true, .events = true });
 
     const win = try sdl.video.Window.init(
-        "Engine Demo — click to capture mouse, ESC to release",
+        "BSP Editor — E=editor  click=split  shift=snap  scroll=grid",
         win_w, win_h, .{},
     );
     defer win.deinit();
-
     const device = try sdl.gpu.Device.init(.{ .spirv = true }, true, null);
 
-    var tree = try eng.BVH(Brush).init(&level, alloc);
-    defer tree.deinit();
+    // ── BSP world ─────────────────────────────────────────────────
+    var bsp = Bsp.init(alloc);
+    defer bsp.deinit();
 
+    try bsp.initGroundPlane(0);
+    try bsp.rebuildMesh();
+
+    // ── Renderer ──────────────────────────────────────────────────
     var renderer = Ren.init(try GpuBackend.init(device, win, alloc));
     defer renderer.gpu.deinit();
 
-    // ── Build geometry ────────────────────────────────────────────
-    var all_verts   = std.ArrayListUnmanaged(eng.Vertex){};
-    defer all_verts.deinit(alloc);
-    var all_indices = std.ArrayListUnmanaged(u32){};
-    defer all_indices.deinit(alloc);
-
-    for (level) |b| {
-        const bm   = gpu_mod.boxVertices(b.aabb, b.color);
-        const base: u32 = @intCast(all_verts.items.len);
-        try all_verts.appendSlice(alloc, &bm.verts);
-        for (bm.indices) |idx| try all_indices.append(alloc, base + idx);
-    }
-
-    const handle = try renderer.upload(
-        std.mem.sliceAsBytes(all_verts.items),
+    const mesh_handle = try renderer.upload(
+        std.mem.sliceAsBytes(bsp.render_verts.items),
         @sizeOf(eng.Vertex),
-        std.mem.sliceAsBytes(all_indices.items),
-        @intCast(all_indices.items.len),
+        std.mem.sliceAsBytes(bsp.render_indices.items),
+        @intCast(bsp.render_indices.items.len),
     );
 
-    var level_aabb = level[0].aabb;
-    for (level[1..]) |b| level_aabb = level_aabb.merge(b.aabb);
-
     // ── Game state ────────────────────────────────────────────────
-    var player       = Player{ .pos = Vec3.new(0, 1.5, -8) };
-    const world      = World{ .tree = &tree, .data = &level };
+    var player = Player{ .pos = Vec3.new(0, 1.5, 0) };
+    const world = World{ .bsp = &bsp, .radius = 0.3 };
     var mouse_locked = false;
-    var running      = true;
+    var editor = Editor{};
+    var running = true;
 
     while (running) {
         var mdx: f32 = 0;
         var mdy: f32 = 0;
 
-        // ── Events ───────────────────────────────────────────────
+        // ── keyboard state (polled once per frame) ────────────────
+        const keys = sdl.keyboard.getState();
+        const sc   = sdl.Scancode;
+        const shift = keys[@intFromEnum(sc.left_shift)];
+
+        // ── events ────────────────────────────────────────────────
         while (sdl.events.poll()) |ev| {
             switch (ev) {
                 .quit => running = false,
 
                 .key_down => |k| {
-                    if (k.scancode) |sc| {
-                        if (sc == .escape and mouse_locked) {
+                    if (k.scancode) |ksc| {
+                        if (ksc == .escape and mouse_locked) {
                             mouse_locked = false;
-                            sdl.mouse.show()                            catch {};
+                            sdl.mouse.show() catch {};
                             sdl.mouse.setWindowRelativeMode(win, false) catch {};
                         }
-                        if (sc == .escape and !mouse_locked) running = false;
+                        if (ksc == .e and mouse_locked) {
+                            editor.active = !editor.active;
+                            editor.placing = false;
+                        }
                     }
                 },
 
                 .mouse_button_down => |m| {
-                    if (m.button == .left and !mouse_locked) {
-                        mouse_locked = true;
-                        sdl.mouse.hide()                           catch {};
-                        sdl.mouse.setWindowRelativeMode(win, true) catch {};
+                    if (m.button == .left) {
+                        if (!mouse_locked) {
+                            mouse_locked = true;
+                            sdl.mouse.hide() catch {};
+                            sdl.mouse.setWindowRelativeMode(win, true) catch {};
+                        } else if (editor.active and !editor.placing) {
+                            // hitscan from eye along look direction
+                            const eye = player.eyePos();
+                            const dir = player.lookDir();
+                            if (bsp.trace(eye, dir, 200, 0)) |hit| {
+                                var anchor = eye.add(dir.scale(hit.dist));
+                                // push slightly into empty side
+                                anchor = anchor.add(hit.normal.scale(0.01));
+                                if (shift) anchor = snapToGrid(anchor, editor.grid_size);
+                                editor.anchor = anchor;
+                                editor.placing = true;
+                            }
+                        }
+                    }
+                },
+
+                .mouse_button_up => |m| {
+                    if (m.button == .left and editor.placing) {
+                        var normal = player.lookDir();
+                        if (shift) {
+                             const snap_y = snapAngle(player.yaw,   editor.angle_step);
+                             const snap_p = snapAngle(player.pitch, editor.angle_step);
+                             const cp = @cos(snap_p);
+                             normal = Vec3.new(
+                                 @sin(snap_y) * cp,
+                                 -@sin(snap_p),      // -sin(pitch), consistent with lookDir fix
+                                 -@cos(snap_y) * cp,
+                             ).normalize();
+                        }
+                        _ = bsp.editorSplit(editor.anchor, normal) catch false;
+                        editor.placing = false;
+                    }
+                },
+
+                .mouse_wheel => |w| {
+                    if (editor.active and w.y != 0) {
+                        const f: f32 = if (w.y > 0) 0.5 else 2.0;
+                        if (editor.placing) {
+                            editor.angle_step = std.math.clamp(
+                                editor.angle_step * f,
+                                std.math.pi / 180.0,
+                                std.math.pi / 4.0,
+                            );
+                        } else {
+                            editor.grid_size = std.math.clamp(
+                                editor.grid_size * f,
+                                0.0625,
+                                16.0,
+                            );
+                        }
                     }
                 },
 
                 .mouse_motion => |m| {
-                    // SDL3 Zig binding: xrel/yrel → x_rel/y_rel
                     if (mouse_locked) { mdx += m.x_rel; mdy += m.y_rel; }
                 },
 
@@ -194,31 +191,42 @@ pub fn main() !void {
             }
         }
 
-        // ── Look ─────────────────────────────────────────────────
+        // ── look ──────────────────────────────────────────────────
         if (mouse_locked) {
-            player.yaw  += mdx * 0.002;
+            player.yaw += mdx * 0.002;
             player.pitch = std.math.clamp(player.pitch + mdy * 0.002, -1.5, 1.5);
         }
 
-        // ── Input ────────────────────────────────────────────────
-        const keys    = sdl.keyboard.getState();
-        const sc      = sdl.Scancode;
-        const fwd_in: f32 = if (keys[@intFromEnum(sc.w)]) 1 else if (keys[@intFromEnum(sc.s)]) -1 else 0;
-        const rgt_in: f32 = if (keys[@intFromEnum(sc.d)]) 1 else if (keys[@intFromEnum(sc.a)]) -1 else 0;
-        const jump        = keys[@intFromEnum(sc.space)];
+        // ── movement input ────────────────────────────────────────
+        const fwd_in: f32 = if (keys[@intFromEnum(sc.w)] ) 1 else if (keys[@intFromEnum(sc.s)] ) @as(f32, -1) else 0;
+        const rgt_in: f32 = if (keys[@intFromEnum(sc.d)] ) 1 else if (keys[@intFromEnum(sc.a)] ) @as(f32, -1) else 0;
+        const jump = keys[@intFromEnum(sc.space)];
 
-        // ── Physics ──────────────────────────────────────────────
+        // ── physics ───────────────────────────────────────────────
         const dt: f32 = 1.0 / 60.0;
         player.step(world, eng.wishdir(fwd_in, rgt_in, player.yaw), jump, dt);
 
-        // ── Render ───────────────────────────────────────────────
+        // ── mesh rebuild (between frames) ─────────────────────────
+        if (bsp.mesh_dirty) {
+            try bsp.rebuildMesh();
+            if (bsp.render_indices.items.len > 0) {
+                try renderer.gpu.updateMesh(
+                    mesh_handle,
+                    std.mem.sliceAsBytes(bsp.render_verts.items),
+                    std.mem.sliceAsBytes(bsp.render_indices.items),
+                    @intCast(bsp.render_indices.items.len),
+                );
+            }
+        }
+
+        // ── render ────────────────────────────────────────────────
         if (try renderer.beginFrame()) {
             const aspect = @as(f32, @floatFromInt(win_w)) / @as(f32, @floatFromInt(win_h));
             renderer.cameraEuler(
                 player.pos, player.yaw, player.pitch, 0.6,
-                90.0, aspect, 0.1, 100.0,
+                90.0, aspect, 0.1, 500.0,
             );
-            renderer.draw(handle, Mat4.identity(), level_aabb, .{ 1, 1, 1, 1 });
+            renderer.drawDirect(mesh_handle, Mat4.identity(), .{ 1, 1, 1, 1 });
             try renderer.endFrame();
         }
     }

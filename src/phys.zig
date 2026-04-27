@@ -36,7 +36,7 @@ pub fn Body(comptime cfg: Config) type {
             const cp = @cos(self.pitch);
             const sy = @sin(self.yaw);
             const cy = @cos(self.yaw);
-            return Vec3.new(sy * cp, sp, -cy * cp).normalize();
+            return Vec3.new(sy * cp, -sp, -cy * cp).normalize(); // -sp matches viewMatrix row 2
         }
 
         /// Advance one frame.  `world` is anything with `.cast(Vec3,Vec3,f32)->?Hit`.

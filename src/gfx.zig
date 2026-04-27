@@ -56,9 +56,9 @@ pub fn Renderer(comptime Gpu: type) type {
             const sy = @sin(yaw);
             const cy = @cos(yaw);
             const eye = pos.add(Vec3.new(0, eye_height, 0));
-            const fwd = Vec3.new(sy * cp, sp, -cy * cp).normalize();
-            const rt = Vec3.new(cy, 0, sy);
-            const up = rt.cross(fwd);
+            const fwd = Vec3.new(sy * cp, -sp, -cy * cp).normalize(); // -sp
+            const rt  = Vec3.new(cy, 0, sy);
+            const up  = rt.cross(fwd);
             self.frust = geo.Frustum.fromCamera(eye, fwd, rt, up, fovy * 3.14159 / 180.0, aspect, near, far);
         }
 
