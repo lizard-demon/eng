@@ -26,7 +26,7 @@ void main() {
     float shade = max(dot(n, normalize(vec3(0.3, 1.0, 0.5))), 0.15);
 
     // triplanar blend — power-8 sharpens seams at 45° surfaces
-    vec3 blend = pow(abs(n), vec3(8.0));
+    vec3 blend = pow(abs(n), vec3(2.0));
     blend /= blend.x + blend.y + blend.z + 1e-5;
 
     // world-space planar UV for each dominant axis

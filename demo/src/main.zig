@@ -37,6 +37,7 @@ const World = struct {
 const Editor = struct {
     active: bool = false,
     placing: bool = false,
+    mode: Bsp.SplitMode = .solid,
     anchor: Vec3 = Vec3.zero(),
     grid_size: f32 = 1.0,
     angle_step: f32 = std.math.pi / 12.0, // 15°
@@ -65,7 +66,7 @@ pub fn main() !void {
     defer sdl.quit(.{ .video = true, .events = true });
 
     const win = try sdl.video.Window.init(
-        "BSP Editor — E=editor  click=split  shift=snap  scroll=grid",
+        "BSP Editor — E=editor  L-click=solid R-click=empty  shift=snap  scroll=grid",
         win_w, win_h, .{},
     );
     defer win.deinit();
@@ -125,19 +126,27 @@ pub fn main() !void {
                 },
 
                 .mouse_button_down => |m| {
-                    if (m.button == .left) {
+                    if (m.button == .left or m.button == .right) {
                         if (!mouse_locked) {
                             mouse_locked = true;
                             sdl.mouse.hide() catch {};
                             sdl.mouse.setWindowRelativeMode(win, true) catch {};
                         } else if (editor.active and !editor.placing) {
+                            editor.mode = if (m.button == .left) .solid else .empty;
+                            
                             // hitscan from eye along look direction
                             const eye = player.eyePos();
                             const dir = player.lookDir();
                             if (bsp.trace(eye, dir, 200, 0)) |hit| {
                                 var anchor = eye.add(dir.scale(hit.dist));
-                                // push slightly into empty side
-                                anchor = anchor.add(hit.normal.scale(0.01));
+                                
+                                // Push slightly into the intended leaf to be split
+                                if (editor.mode == .solid) {
+                                    anchor = anchor.add(hit.normal.scale(0.01)); // Push into empty space
+                                } else {
+                                    anchor = anchor.sub(hit.normal.scale(0.01)); // Push into solid space
+                                }
+
                                 if (shift) anchor = snapToGrid(anchor, editor.grid_size);
                                 editor.anchor = anchor;
                                 editor.placing = true;
@@ -147,7 +156,10 @@ pub fn main() !void {
                 },
 
                 .mouse_button_up => |m| {
-                    if (m.button == .left and editor.placing) {
+                    const is_left = m.button == .left and editor.mode == .solid;
+                    const is_right = m.button == .right and editor.mode == .empty;
+
+                    if ((is_left or is_right) and editor.placing) {
                         var normal = player.lookDir();
                         if (shift) {
                              const snap_y = snapAngle(player.yaw,   editor.angle_step);
@@ -159,7 +171,9 @@ pub fn main() !void {
                                  -@cos(snap_y) * cp,
                              ).normalize();
                         }
-                        _ = bsp.editorSplit(editor.anchor, normal) catch false;
+                        
+                        // Pass the mode through to the BSP
+                        _ = bsp.editorSplit(editor.anchor, normal, editor.mode) catch false;
                         editor.placing = false;
                     }
                 },

@@ -1,5 +1,6 @@
 //! phys.zig — Quake-style character controller, comptime-configured
 
+const std = @import("std");
 const math = @import("math.zig");
 const Vec3 = math.Vec3;
 
@@ -36,10 +37,9 @@ pub fn Body(comptime cfg: Config) type {
             const cp = @cos(self.pitch);
             const sy = @sin(self.yaw);
             const cy = @cos(self.yaw);
-            return Vec3.new(sy * cp, -sp, -cy * cp).normalize(); // -sp matches viewMatrix row 2
+            return Vec3.new(sy * cp, -sp, -cy * cp).normalize();
         }
 
-        /// Advance one frame.  `world` is anything with `.cast(Vec3,Vec3,f32)->?Hit`.
         pub fn step(self: *Self, world: anytype, wish: Vec3, jump: bool, dt: f32) void {
             if (self.grounded) {
                 const spd = @sqrt(self.vel.data[0] * self.vel.data[0] + self.vel.data[2] * self.vel.data[2]);
@@ -69,21 +69,56 @@ pub fn Body(comptime cfg: Config) type {
         fn slideMove(self: *Self, world: anytype, delta: Vec3) void {
             var rem = delta;
             self.grounded = false;
+
             for (0..cfg.max_slides) |_| {
                 const l = rem.length();
-                if (l < 1e-6) break;
+                
+                // ── Noise Floor ───────────────────────────────────────────
+                // Use Zig's native epsilon to dynamically calculate the noise floor
+                // based on world position. Prevents micro-slides.
+                const pos_mag = @max(@abs(self.pos.data[0]), @max(@abs(self.pos.data[1]), @abs(self.pos.data[2])));
+                const eps = std.math.floatEpsAt(f32, @max(1.0, pos_mag)) * 10.0;
+                if (l < eps) break;
+
                 const dir = rem.scale(1.0 / l);
-                const h = world.cast(self.pos, dir, @max(l, cfg.margin * 2)) orelse {
+                
+                // Trace up to the remaining length PLUS the margin to catch grazing hits
+                const h = world.cast(self.pos, dir, l + cfg.margin) orelse {
                     self.pos = self.pos.add(rem);
                     break;
                 };
-                self.pos = self.pos.add(rem.scale(@max(0, h.dist - cfg.margin) / l));
-                if (rem.dot(h.normal) >= 0) break;
+
+                // Move precisely to the hit point, minus a tiny mathematical offset
+                const move_dist = @max(0, h.dist - eps);
+                if (move_dist > 0) {
+                    self.pos = self.pos.add(dir.scale(move_dist));
+                    const move_l = @min(move_dist, l);
+                    rem = rem.sub(dir.scale(move_l));
+                }
+
                 if (h.normal.data[1] > cfg.slope_limit) self.grounded = true;
-                rem = rem.sub(h.normal.scale(rem.dot(h.normal)));
-                const vn = self.vel.dot(h.normal);
-                if (vn < 0) self.vel = self.vel.sub(h.normal.scale(vn));
+
+                // ── The Arc Nudge ─────────────────────────────────────────
+                // Physically pop the player out of the collision plane by `margin`.
+                // 1. Escapes the t=0 floating point deadzone loop.
+                // 2. Accumulates over multi-plane hits to seamlessly push the 
+                //    player in an arc *around* sharp convex Minkowski spikes.
+                self.pos = self.pos.add(h.normal.scale(cfg.margin));
+
+                rem = clipVelocity(rem, h.normal);
+                self.vel = clipVelocity(self.vel, h.normal);
             }
+        }
+
+        fn clipVelocity(in: Vec3, normal: Vec3) Vec3 {
+            const backoff = in.dot(normal);
+            if (backoff >= 0) return in;
+            var out = in.sub(normal.scale(backoff));
+            
+            // Double-scrub via Gram-Schmidt to mathematically kill all ULP drift
+            const res = out.dot(normal);
+            if (res < 0) out = out.sub(normal.scale(res));
+            return out;
         }
     };
 }

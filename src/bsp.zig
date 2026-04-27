@@ -25,6 +25,11 @@ pub const Bsp = struct {
     pub inline fn isSolid(i: u32) bool { return i == solid_leaf; }
     pub inline fn isEmpty(i: u32) bool { return i == empty_leaf; }
 
+    pub const SplitMode = enum {
+        solid, // Target empty space, add a solid volume
+        empty, // Target solid space, carve an empty volume
+    };
+
     /// BSP node — one splitting plane, two children.
     pub const Node = struct {
         plane: u32, // index into planes[]
@@ -75,7 +80,6 @@ pub const Bsp = struct {
     }
 
     /// Bootstrap with a horizontal ground plane at `height`.
-    /// Below = solid, above = empty.
     pub fn initGroundPlane(self: *Self, height: f32) !void {
         const pi = try self.addPlane(.{
             .normal = Vec3.new(0, 1, 0),
@@ -86,44 +90,51 @@ pub const Bsp = struct {
     }
 
     /// Editor split: insert a plane through `point` with given `normal`.
-    /// The leaf containing `point` is split; the **front** child becomes
-    /// solid (the side behind the surface from the player's viewpoint).
-    /// Returns true if a split was performed.
-    pub fn editorSplit(self: *Self, point: Vec3, normal: Vec3) !bool {
+    /// Editor split: insert a plane through `point` with given `normal`.
+    pub fn editorSplit(self: *Self, point: Vec3, normal: Vec3, mode: SplitMode) !bool {
         if (self.nodes.len == 0) return false;
-        const dist = -normal.dot(point);
-        const pi = try self.addPlane(.{ .normal = normal, .dist = dist });
-        const did = try self.splitLeaf(0, point, pi);
+        
+        // Invert the normal for carving so the new empty space is created 
+        // on the correct side of the splitting plane relative to the player.
+        const n = if (mode == .empty) normal.neg() else normal;
+        
+        const dist = -n.dot(point);
+        const pi = try self.addPlane(.{ .normal = n, .dist = dist });
+        const did = try self.splitLeaf(0, point, pi, mode);
         if (did) self.mesh_dirty = true;
         return did;
     }
 
-    /// Walk from `node_idx` toward the empty leaf containing `point`
-    /// and replace it with a new internal node whose front = solid.
-    fn splitLeaf(self: *Self, node_idx: u32, point: Vec3, plane_idx: u32) !bool {
+    /// Walk from `node_idx` toward the leaf containing `point`.
+    fn splitLeaf(self: *Self, node_idx: u32, point: Vec3, plane_idx: u32, mode: SplitMode) !bool {
         if (isSolid(node_idx) or isEmpty(node_idx)) return false;
 
         const slice = self.nodes.slice();
         const plane = self.planes.items[slice.items(.plane)[node_idx]];
         const d = plane.distToPoint(point);
+        const is_front = d >= 0;
 
-        if (d >= 0) {
-            const front = slice.items(.front)[node_idx];
-            if (isEmpty(front)) {
-                const nn = try self.addNode(plane_idx, solid_leaf, empty_leaf);
-                self.nodes.slice().items(.front)[node_idx] = nn;
-                return true;
+        const child_val = if (is_front) slice.items(.front)[node_idx] else slice.items(.back)[node_idx];
+
+        if (isLeaf(child_val)) {
+            if (mode == .solid and !isEmpty(child_val)) return false;
+            if (mode == .empty and !isSolid(child_val)) return false;
+
+            const f_child = if (mode == .solid) solid_leaf else empty_leaf;
+            const b_child = if (mode == .solid) empty_leaf else solid_leaf;
+
+            const nn = try self.addNode(plane_idx, f_child, b_child);
+
+            const new_slice = self.nodes.slice();
+            if (is_front) {
+                new_slice.items(.front)[node_idx] = nn;
+            } else {
+                new_slice.items(.back)[node_idx] = nn;
             }
-            return self.splitLeaf(front, point, plane_idx);
-        } else {
-            const back = slice.items(.back)[node_idx];
-            if (isEmpty(back)) {
-                const nn = try self.addNode(plane_idx, solid_leaf, empty_leaf);
-                self.nodes.slice().items(.back)[node_idx] = nn;
-                return true;
-            }
-            return self.splitLeaf(back, point, plane_idx);
+            return true;
         }
+
+        return self.splitLeaf(child_val, point, plane_idx, mode);
     }
 
     // ── point classification ──────────────────────────────────────
@@ -144,8 +155,6 @@ pub const Bsp = struct {
             self.classifyPoint(s.items(.back)[idx], p);
     }
 
-    /// Does a sphere at `p` with `radius` touch any solid in the
-    /// subtree rooted at `idx`?
     fn sphereInSolid(self: *const Self, idx: u32, p: Vec3, radius: f32) bool {
         if (isSolid(idx)) return true;
         if (isEmpty(idx)) return false;
@@ -158,7 +167,7 @@ pub const Bsp = struct {
             self.sphereInSolid(s.items(.back)[idx], p, radius);
     }
 
-    // ── collision trace (Quake-1 style recursive hull check) ──────
+    // ── collision trace ───────────────────────────────────────────
 
     pub const TraceResult = struct { normal: Vec3, dist: f32 };
 
@@ -170,8 +179,6 @@ pub const Bsp = struct {
 
     const trace_eps: f32 = 0.001;
 
-    /// Trace a sphere from `start` along unit `dir` for up to `max_d`.
-    /// `radius` = 0 for a point / hitscan trace.
     pub fn trace(
         self: *const Self,
         start: Vec3,
@@ -188,7 +195,6 @@ pub const Bsp = struct {
         return null;
     }
 
-    /// Returns `true` if the trace can continue (not blocked at this level).
     fn traceRecursive(
         self: *const Self,
         idx: u32,
@@ -199,9 +205,9 @@ pub const Bsp = struct {
         radius: f32,
         st: *TraceState,
     ) bool {
-        if (st.fraction <= p1f) return true; // already hit nearer
+        if (st.fraction <= p1f) return true; 
         if (isEmpty(idx)) return true;
-        if (isSolid(idx)) return true; // start-in-solid; handled by parent
+        if (isSolid(idx)) return true;
 
         const s = self.nodes.slice();
         const plane = self.planes.items[s.items(.plane)[idx]];
@@ -211,20 +217,22 @@ pub const Bsp = struct {
         const t1 = plane.distToPoint(p1);
         const t2 = plane.distToPoint(p2);
 
-        // ── entirely one side? ────────────────────────────────────
         if (t1 >= radius and t2 >= radius)
             return self.traceRecursive(fc, p1f, p2f, p1, p2, radius, st);
         if (t1 < -radius and t2 < -radius)
             return self.traceRecursive(bc, p1f, p2f, p1, p2, radius, st);
 
-        // ── straddle — split segment at crossing ──────────────────
         const front_first = t1 >= t2;
         const near = if (front_first) fc else bc;
         const far = if (front_first) bc else fc;
         const delta = t1 - t2;
 
         var frac: f32 = 0;
-        if (@abs(delta) > 1e-8) {
+
+        // Dynamically scaled epsilon based on distance from plane
+        const eps = std.math.floatEpsAt(f32, @max(@abs(t1), @abs(t2)));
+
+        if (@abs(delta) > eps) {
             frac = if (front_first)
                 (t1 - radius - trace_eps) / delta
             else
@@ -235,11 +243,9 @@ pub const Bsp = struct {
         const midf = p1f + (p2f - p1f) * frac;
         const mid = Vec3.lerp(p1, p2, frac);
 
-        // trace near side
         if (!self.traceRecursive(near, p1f, midf, p1, mid, radius, st))
             return false;
 
-        // check far side at crossing point
         if (self.sphereInSolid(far, mid, radius)) {
             if (midf < st.fraction) {
                 st.fraction = @max(0, midf);
@@ -249,19 +255,18 @@ pub const Bsp = struct {
             return false;
         }
 
-        // continue through far side
         return self.traceRecursive(far, midf, p2f, mid, p2, radius, st);
     }
 
-    // ── render mesh generation ────────────────────────────────────
+    // ── render mesh generation (Exact CSG Filtering) ──────────────
 
     const max_poly: usize = 48;
     const base_size: f32 = 2000.0;
     const max_depth: usize = 64;
+    const split_eps: f32 = 1e-4;
 
     const ClipInfo = struct { plane: u32, flip: bool };
 
-    /// Rebuild cached render geometry from the BSP.
     pub fn rebuildMesh(self: *Self) !void {
         self.render_verts.clearRetainingCapacity();
         self.render_indices.clearRetainingCapacity();
@@ -283,16 +288,32 @@ pub const Bsp = struct {
         const pi = s.items(.plane)[idx];
         const fc = s.items(.front)[idx];
         const bc = s.items(.back)[idx];
+        const plane = self.planes.items[pi];
 
-        const fs = self.hasSolid(fc);
-        const fe = self.hasEmpty(fc);
-        const bs = self.hasSolid(bc);
-        const be = self.hasEmpty(bc);
+        // 1. Build massive base polygon
+        var poly: [max_poly]Vec3 = undefined;
+        var count: usize = 4;
+        makeBasePoly(plane, base_size, poly[0..4]);
 
-        // emit face where solid meets empty across this plane
-        if (fs and be) try self.emitFace(pi, stack[0..depth], true);
-        if (bs and fe) try self.emitFace(pi, stack[0..depth], false);
+        // 2. Clip to node bounding volume
+        for (stack[0..depth]) |a| {
+            var cp = self.planes.items[a.plane];
+            if (a.flip) {
+                cp.normal = cp.normal.neg();
+                cp.dist = -cp.dist;
+            }
+            var out: [max_poly]Vec3 = undefined;
+            count = clipConvex(poly[0..count], cp, &out);
+            if (count < 3) break;
+            @memcpy(poly[0..count], out[0..count]);
+        }
 
+        // 3. Exact CSG Filtering: push poly down both subtrees to extract visible boundaries
+        if (count >= 3) {
+            try self.filterFront(poly[0..count], fc, bc, plane);
+        }
+
+        // Recurse
         if (depth < max_depth) {
             stack[depth] = .{ .plane = pi, .flip = false };
             try self.meshNode(fc, stack, depth + 1);
@@ -301,64 +322,72 @@ pub const Bsp = struct {
         }
     }
 
-    fn hasSolid(self: *const Self, idx: u32) bool {
-        if (isSolid(idx)) return true;
-        if (isEmpty(idx)) return false;
-        const s = self.nodes.slice();
-        return self.hasSolid(s.items(.front)[idx]) or
-            self.hasSolid(s.items(.back)[idx]);
-    }
-    fn hasEmpty(self: *const Self, idx: u32) bool {
-        if (isEmpty(idx)) return true;
-        if (isSolid(idx)) return false;
-        const s = self.nodes.slice();
-        return self.hasEmpty(s.items(.front)[idx]) or
-            self.hasEmpty(s.items(.back)[idx]);
-    }
-
-    fn emitFace(
-        self: *Self,
-        pi: u32,
-        ancestors: []const ClipInfo,
-        flip: bool,
-    ) !void {
-        const plane = self.planes.items[pi];
-
-        // build large base quad on the splitting plane
-        var poly: [max_poly]Vec3 = undefined;
-        var count: usize = 4;
-        makeBasePoly(plane, base_size, poly[0..4]);
-
-        // clip against every ancestor constraint
-        for (ancestors) |a| {
-            var cp = self.planes.items[a.plane];
-            if (a.flip) {
-                cp.normal = cp.normal.neg();
-                cp.dist = -cp.dist;
-            }
-            var out: [max_poly]Vec3 = undefined;
-            count = clipConvex(poly[0..count], cp, &out);
-            if (count < 3) return;
-            @memcpy(poly[0..count], out[0..count]);
+    /// Pushes polygon fragments down the Front subtree to resolve Solid/Empty front state
+    fn filterFront(self: *Self, verts: []const Vec3, front_node: u32, back_node: u32, split_plane: Plane) !void {
+        if (isSolid(front_node)) {
+            try self.filterBack(verts, back_node, split_plane, true);
+            return;
         }
-        if (count < 3) return;
+        if (isEmpty(front_node)) {
+            try self.filterBack(verts, back_node, split_plane, false);
+            return;
+        }
 
+        const s = self.nodes.slice();
+        const plane = self.planes.items[s.items(.plane)[front_node]];
+        var fv: [max_poly]Vec3 = undefined;
+        var bv: [max_poly]Vec3 = undefined;
+        const res = splitConvex(verts, plane, &fv, &bv);
+
+        if (res.f >= 3) try self.filterFront(fv[0..res.f], s.items(.front)[front_node], back_node, split_plane);
+        if (res.b >= 3) try self.filterFront(bv[0..res.b], s.items(.back)[front_node], back_node, split_plane);
+    }
+
+    /// Pushes fragments down the Back subtree to match boundaries.
+    /// Emits face only if Front and Back differ (Solid vs Empty).
+    fn filterBack(self: *Self, verts: []const Vec3, back_node: u32, split_plane: Plane, front_is_solid: bool) !void {
+        if (isSolid(back_node)) {
+            if (!front_is_solid) {
+                // Front=Empty, Back=Solid -> face points Front
+                try self.pushRenderFace(verts, split_plane, false);
+            }
+            return;
+        }
+        if (isEmpty(back_node)) {
+            if (front_is_solid) {
+                // Front=Solid, Back=Empty -> face points Back (flipped)
+                try self.pushRenderFace(verts, split_plane, true);
+            }
+            return;
+        }
+
+        const s = self.nodes.slice();
+        const plane = self.planes.items[s.items(.plane)[back_node]];
+        var fv: [max_poly]Vec3 = undefined;
+        var bv: [max_poly]Vec3 = undefined;
+        const res = splitConvex(verts, plane, &fv, &bv);
+
+        if (res.f >= 3) try self.filterBack(fv[0..res.f], s.items(.front)[back_node], split_plane, front_is_solid);
+        if (res.b >= 3) try self.filterBack(bv[0..res.b], s.items(.back)[back_node], split_plane, front_is_solid);
+    }
+
+    fn pushRenderFace(self: *Self, verts: []const Vec3, plane: Plane, flip: bool) !void {
+        if (verts.len < 3) return;
         const face_n = if (flip) plane.normal.neg() else plane.normal;
         const color = normalColor(face_n);
         const base: u32 = @intCast(self.render_verts.items.len);
 
-        // emit vertices (reverse winding when flipped)
         if (flip) {
-            var i: usize = count;
+            var i: usize = verts.len;
             while (i > 0) {
                 i -= 1;
                 try self.render_verts.append(self.alloc, .{
-                    .pos = .{ poly[i].data[0], poly[i].data[1], poly[i].data[2] },
+                    .pos = .{ verts[i].data[0], verts[i].data[1], verts[i].data[2] },
                     .color = color,
                 });
             }
         } else {
-            for (poly[0..count]) |v| {
+            for (verts) |v| {
                 try self.render_verts.append(self.alloc, .{
                     .pos = .{ v.data[0], v.data[1], v.data[2] },
                     .color = color,
@@ -366,8 +395,7 @@ pub const Bsp = struct {
             }
         }
 
-        // fan triangulation
-        for (2..count) |i| {
+        for (2..verts.len) |i| {
             try self.render_indices.append(self.alloc, base);
             try self.render_indices.append(self.alloc, base + @as(u32, @intCast(i - 1)));
             try self.render_indices.append(self.alloc, base + @as(u32, @intCast(i)));
@@ -388,7 +416,50 @@ pub const Bsp = struct {
         out[3] = c.sub(t1.scale(size)).add(t2.scale(size));
     }
 
-    /// Sutherland-Hodgman: clip convex polygon, keep front (dist ≥ 0).
+    /// Sutherland-Hodgman: exact bi-directional split
+    fn splitConvex(verts: []const Vec3, plane: Plane, fv: *[max_poly]Vec3, bv: *[max_poly]Vec3) struct { f: usize, b: usize } {
+        if (verts.len < 3) return .{ .f = 0, .b = 0 };
+        var f: usize = 0;
+        var b: usize = 0;
+
+        var dists: [max_poly]f32 = undefined;
+        var has_front = false;
+        var has_back = false;
+        for (verts, 0..) |v, i| {
+            dists[i] = plane.distToPoint(v);
+            if (dists[i] > split_eps) has_front = true;
+            if (dists[i] < -split_eps) has_back = true;
+        }
+
+        if (!has_back) {
+            @memcpy(fv[0..verts.len], verts);
+            return .{ .f = verts.len, .b = 0 };
+        }
+        if (!has_front) {
+            @memcpy(bv[0..verts.len], verts);
+            return .{ .f = 0, .b = verts.len };
+        }
+
+        for (0..verts.len) |i| {
+            const p1 = verts[i];
+            const p2 = verts[(i + 1) % verts.len];
+            const d1 = dists[i];
+            const d2 = dists[(i + 1) % verts.len];
+
+            if (d1 >= -split_eps and f < max_poly) { fv[f] = p1; f += 1; }
+            if (d1 <= split_eps and b < max_poly) { bv[b] = p1; b += 1; }
+
+            if ((d1 > split_eps and d2 < -split_eps) or (d1 < -split_eps and d2 > split_eps)) {
+                const t = d1 / (d1 - d2);
+                const mid = Vec3.lerp(p1, p2, t);
+                if (f < max_poly) { fv[f] = mid; f += 1; }
+                if (b < max_poly) { bv[b] = mid; b += 1; }
+            }
+        }
+        return .{ .f = if (f >= 3) f else 0, .b = if (b >= 3) b else 0 };
+    }
+
+    /// Sutherland-Hodgman: clip convex polygon, keep front (dist ≥ -eps).
     fn clipConvex(verts: []const Vec3, plane: Plane, out: *[max_poly]Vec3) usize {
         if (verts.len < 3) return 0;
         var n: usize = 0;
@@ -397,21 +468,18 @@ pub const Bsp = struct {
             const b = verts[(i + 1) % verts.len];
             const da = plane.distToPoint(a);
             const db = plane.distToPoint(b);
-            if (da >= 0) {
-                if (n < max_poly) {
-                    out[n] = a;
-                    n += 1;
-                }
-                if (db < 0 and n < max_poly) {
+            if (da >= -split_eps) {
+                if (n < max_poly) { out[n] = a; n += 1; }
+                if (db < -split_eps and n < max_poly) {
                     out[n] = Vec3.lerp(a, b, da / (da - db));
                     n += 1;
                 }
-            } else if (db >= 0 and n < max_poly) {
+            } else if (db >= -split_eps and n < max_poly) {
                 out[n] = Vec3.lerp(a, b, da / (da - db));
                 n += 1;
             }
         }
-        return n;
+        return if (n >= 3) n else 0;
     }
 
     fn normalColor(n: Vec3) [4]f32 {
