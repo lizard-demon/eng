@@ -16,7 +16,6 @@ const Player = eng.Body(.{
     .air_speed   = 1.0,
     .accel       = 55.0,
     .friction    = 6.0,
-    .margin      = 0.02,
     .slope_limit = 0.707,
     .max_slides  = 4,
     .radius      = 0.3,

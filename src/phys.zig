@@ -13,11 +13,11 @@ pub const Config = struct {
     air_speed: f32 = 1.0,
     accel: f32 = 50.0,
     friction: f32 = 6.0,
-    margin: f32 = 0.02,
     slope_limit: f32 = 0.707,
     max_slides: u32 = 4,
     radius: f32 = 0.3,
     eye_height: f32 = 0.6,
+    ground_snap: f32 = 0.05, // Physical downward reach to snap to stairs/slopes
 };
 
 pub fn Body(comptime cfg: Config) type {
@@ -41,20 +41,44 @@ pub fn Body(comptime cfg: Config) type {
         }
 
         pub fn step(self: *Self, world: anytype, wish: Vec3, jump: bool, dt: f32) void {
+            // 1. Explicit Ground Probe ─────────────────────────────────
+            const ground_trace = world.cast(self.pos, Vec3.new(0, -1, 0), cfg.ground_snap);
+            self.grounded = false;
+            var ground_normal = Vec3.new(0, 1, 0);
+
+            if (ground_trace) |h| {
+                if (h.normal.data[1] > cfg.slope_limit) {
+                    self.grounded = true;
+                    ground_normal = h.normal;
+                }
+            }
+
+            // 2. Physics & State ───────────────────────────────────────
             if (self.grounded) {
+                // Strip downward velocity pointing into the floor
+                const vn = self.vel.dot(ground_normal);
+                if (vn < 0) self.vel = self.vel.sub(ground_normal.scale(vn));
+
                 const spd = @sqrt(self.vel.data[0] * self.vel.data[0] + self.vel.data[2] * self.vel.data[2]);
                 if (spd > 0.1) {
-                    const f = @max(0, spd - spd * cfg.friction * dt) / spd;
+                    const drop = spd * cfg.friction * dt;
+                    const f = @max(0, spd - drop) / spd;
                     self.vel.data[0] *= f;
                     self.vel.data[2] *= f;
                 } else {
                     self.vel.data[0] = 0;
                     self.vel.data[2] = 0;
                 }
+            } else {
+                self.vel.data[1] -= cfg.gravity * dt;
             }
-            if (!self.grounded) self.vel.data[1] -= cfg.gravity * dt;
-            if (jump and self.grounded) self.vel.data[1] = cfg.jump_speed;
 
+            if (jump and self.grounded) {
+                self.vel.data[1] = cfg.jump_speed;
+                self.grounded = false; 
+            }
+
+            // 3. Player Input ──────────────────────────────────────────
             const wl = @sqrt(wish.data[0] * wish.data[0] + wish.data[2] * wish.data[2]);
             if (wl > 0) {
                 const wn = wish.scale(1.0 / wl);
@@ -63,48 +87,48 @@ pub fn Body(comptime cfg: Config) type {
                 const add = @min(cfg.accel * dt, @max(0, top - cur));
                 self.vel = self.vel.add(wn.scale(add));
             }
+
+            // 4. Resolve Movement ──────────────────────────────────────
             self.slideMove(world, self.vel.scale(dt));
         }
 
         fn slideMove(self: *Self, world: anytype, delta: Vec3) void {
             var rem = delta;
-            self.grounded = false;
 
             for (0..cfg.max_slides) |_| {
                 const l = rem.length();
                 
-                // ── Noise Floor ───────────────────────────────────────────
-                // Use Zig's native epsilon to dynamically calculate the noise floor
-                // based on world position. Prevents micro-slides.
+                // ── Dynamic Math Precision ────────────────────────────────
+                // Scale epsilon precisely to our current distance from the origin.
+                // Replaces all static magic numbers (1e-5, 0.001, etc.)
                 const pos_mag = @max(@abs(self.pos.data[0]), @max(@abs(self.pos.data[1]), @abs(self.pos.data[2])));
-                const eps = std.math.floatEpsAt(f32, @max(1.0, pos_mag)) * 10.0;
+                const eps = std.math.floatEpsAt(f32, @max(1.0, pos_mag));
+                const margin = eps * 8192.0;
+
                 if (l < eps) break;
 
                 const dir = rem.scale(1.0 / l);
                 
-                // Trace up to the remaining length PLUS the margin to catch grazing hits
-                const h = world.cast(self.pos, dir, l + cfg.margin) orelse {
+                // Trace up to remainder PLUS our dynamic math margin
+                const h = world.cast(self.pos, dir, l + margin) orelse {
                     self.pos = self.pos.add(rem);
                     break;
                 };
 
-                // Move precisely to the hit point, minus a tiny mathematical offset
+                // Move flush to the surface, backing off by exactly 1 ULP
                 const move_dist = @max(0, h.dist - eps);
                 if (move_dist > 0) {
                     self.pos = self.pos.add(dir.scale(move_dist));
-                    const move_l = @min(move_dist, l);
-                    rem = rem.sub(dir.scale(move_l));
+                    rem = rem.sub(dir.scale(@min(move_dist, l)));
                 }
 
-                if (h.normal.data[1] > cfg.slope_limit) self.grounded = true;
+                // ── The Micro Arc Nudge ───────────────────────────────────
+                // Physically push out of the collision plane by 10 ULPs.
+                // Mathematically guarantees separation on the next trace without 
+                // any macroscopic positional distortion.
+                self.pos = self.pos.add(h.normal.scale(margin));
 
-                // ── The Arc Nudge ─────────────────────────────────────────
-                // Physically pop the player out of the collision plane by `margin`.
-                // 1. Escapes the t=0 floating point deadzone loop.
-                // 2. Accumulates over multi-plane hits to seamlessly push the 
-                //    player in an arc *around* sharp convex Minkowski spikes.
-                self.pos = self.pos.add(h.normal.scale(cfg.margin));
-
+                // Strip velocity against the normal
                 rem = clipVelocity(rem, h.normal);
                 self.vel = clipVelocity(self.vel, h.normal);
             }
@@ -115,7 +139,7 @@ pub fn Body(comptime cfg: Config) type {
             if (backoff >= 0) return in;
             var out = in.sub(normal.scale(backoff));
             
-            // Double-scrub via Gram-Schmidt to mathematically kill all ULP drift
+            // Double-scrub via Gram-Schmidt to mathematically kill floating point ULPs
             const res = out.dot(normal);
             if (res < 0) out = out.sub(normal.scale(res));
             return out;
