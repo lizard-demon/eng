@@ -44,8 +44,8 @@ pub fn build(b: *std.Build) void {
     // must be passed explicitly.  The exe compile step depends on all
     // shader steps so @embedFile("shaders/…spv") always finds the files.
     inline for (.{
-        .{ .name = "triangle.vert", .stage = "vertex"   },
-        .{ .name = "triangle.frag", .stage = "fragment" },
+        .{ .name = "basic.vert", .stage = "vertex"   },
+        .{ .name = "basic.frag", .stage = "fragment" },
     }) |s| {
         const glslc = b.addSystemCommand(&.{
             "glslc",
