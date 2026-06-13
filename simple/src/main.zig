@@ -174,6 +174,7 @@ pub const map = struct {
     pub const model_t = struct { headnode: [4]i32 }; 
     pub const clipnode_t = struct { p: u32, f: i32, b: i32 };
 
+    raw_ents: []const u8 = &[_]u8{},
     alloc: std.mem.Allocator,
     bsp2: bool = false,
     
@@ -220,6 +221,9 @@ pub const map = struct {
             dirs[i] = .{ .o = u32l(data, 4 + i * 8), .l = u32l(data, 4 + i * 8 + 4) };
             if (dirs[i].o + dirs[i].l > eof_ofs) eof_ofs = dirs[i].o + dirs[i].l;
         }
+
+        // 0: entities
+        self.raw_ents = data[dirs[0].o .. dirs[0].o + dirs[0].l];
 
         // 3: vertices (SWIZZLED Z-UP to Y-UP)
         const v_dir = dirs[3]; var i: usize = 0; 
@@ -357,6 +361,30 @@ pub const map = struct {
         }
     }
 
+    pub fn get_spawn(self: *map) vec3 {
+        // Break the entity string into { blocks }
+        var it = std.mem.splitScalar(u8, self.raw_ents, '{');
+        while (it.next()) |block| {
+            if (std.mem.indexOf(u8, block, "\"classname\" \"info_player_start\"") != null) {
+                if (std.mem.indexOf(u8, block, "\"origin\"")) |o_idx| {
+                    if (std.mem.indexOfPos(u8, block, o_idx + 8, "\"")) |q1| {
+                        if (std.mem.indexOfPos(u8, block, q1 + 1, "\"")) |q2| {
+                            // Extract coordinates, handling arbitrary spacing
+                            var coords = std.mem.tokenizeAny(u8, block[q1 + 1 .. q2], " \t");
+                            const x = std.fmt.parseFloat(f32, coords.next() orelse "0") catch 0;
+                            const y = std.fmt.parseFloat(f32, coords.next() orelse "0") catch 0;
+                            const z = std.fmt.parseFloat(f32, coords.next() orelse "0") catch 0;
+                            
+                            // SWIZZLE! Quake is Z-Up. We need Y-Up.
+                            return vec3.new(x, z, -y); 
+                        }
+                    }
+                }
+            }
+        }
+        return vec3.new(0, 0, 0); // Safe fallback if no spawn is found
+    }
+
     pub fn trace(self: *map, start: vec3, dir: vec3, max: f32) ?struct { n: vec3, d: f32 } {
         if (self.clipnodes.items.len == 0 or self.models.items.len == 0) return null;
         var st = struct { frac: f32 = 1.0, norm: vec3 = vec3.zero(), hit: bool = false }{};
@@ -477,7 +505,7 @@ pub fn main() !void {
     
     const id = try ctx.upmesh(lvl.rverts.items, lvl.ridx.items);
     
-    var plr = player{};
+    var plr = player{ .pos = vec3.new(-1500,10,900) };
     var run = true;
     var lock = false;
 
@@ -513,9 +541,16 @@ pub fn main() !void {
         plr.step(&lvl, wish, keys[@intFromEnum(sc.space)], 1.0 / 60.0);
 
         if (try ctx.begin()) {
-            const mvp = mat4.persp(90.0, 1280.0 / 720.0, 4.0, 8192.0).mul(mat4.view(plr.pos, plr.yaw, plr.pitch));
+            const eye_pos = plr.pos.add(vec3.new(0, 22.0, 0));
+            const mvp = mat4.persp(70.0, 1280.0 / 720.0, 1.0, 8192.0).mul(mat4.view(eye_pos, plr.yaw, plr.pitch));
             ctx.draw(id, mvp);
             try ctx.end();
         }
+
+        //if (try ctx.begin()) {
+        //    const mvp = mat4.persp(90.0, 1280.0 / 720.0, 4.0, 8192.0).mul(mat4.view(plr.pos, plr.yaw, plr.pitch));
+        //    ctx.draw(id, mvp);
+        //    try ctx.end();
+        //}
     }
 }
