@@ -16,16 +16,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    const gpu_mod = b.createModule(.{
-        .root_source_file = b.path("src/gpu_sdl3.zig"),
-        .target  = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "engine", .module = engine_dep.module("engine") },
-            .{ .name = "sdl3",   .module = sdl3.module("sdl3") },
-        },
-    });
-
     const mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target  = target,
@@ -33,7 +23,6 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "engine",   .module = engine_dep.module("engine") },
             .{ .name = "sdl3",     .module = sdl3.module("sdl3") },
-            .{ .name = "gpu_sdl3", .module = gpu_mod },
         },
     });
 
@@ -50,9 +39,9 @@ pub fn build(b: *std.Build) void {
         const glslc = b.addSystemCommand(&.{
             "glslc",
             "-fshader-stage=" ++ s.stage,
-            "src/shaders/" ++ s.name ++ ".glsl",
+            "src/fmwk/shaders/" ++ s.name ++ ".glsl",
             "-o",
-            "src/shaders/" ++ s.name ++ ".spv",
+            "src/fmwk/shaders/" ++ s.name ++ ".spv",
         });
         glslc.setCwd(b.path("."));
         // Exe compilation depends on shaders existing for @embedFile.
