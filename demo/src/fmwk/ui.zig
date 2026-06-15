@@ -1,4 +1,5 @@
 const std = @import("std");
+const math = @import("math.zig");
 
 const font: [128][5]u8 = init: {
     var f = [_][5]u8{.{ 0, 0, 0, 0, 0 }} ** 128;
@@ -127,9 +128,9 @@ pub fn UiState(comptime Vertex: type) type {
 
         pub fn begin(self: *Self, in: anytype) void {
             if (!in.mouse_locked) {
-                self.mx = in.mx;
-                self.my = in.my;
-                self.mdown = in.mdown_left;
+                self.mx = @floatFromInt(in.mouse_x);
+                self.my = @floatFromInt(in.mouse_y);
+                self.mdown = in.mouse(.left);
             } else {
                 self.mx = -1;
                 self.my = -1;
@@ -150,11 +151,17 @@ pub fn UiState(comptime Vertex: type) type {
 
         fn quad(self: *Self, x: f32, y: f32, w: f32, h: f32, c: [4]f32) !void {
             const b: u32 = @intCast(self.verts.items.len);
+            
+            const ix = math.Unit.fix(x);
+            const iy = math.Unit.fix(y);
+            const iw = math.Unit.fix(w);
+            const ih = math.Unit.fix(h);
+
             try self.verts.appendSlice(self.alloc, &.{
-                .{ .pos = .{ x, y, 0 }, .color = c },
-                .{ .pos = .{ x + w, y, 0 }, .color = c },
-                .{ .pos = .{ x + w, y + h, 0 }, .color = c },
-                .{ .pos = .{ x, y + h, 0 }, .color = c },
+                .{ .pos = .{ ix, iy, math.Unit.ZERO }, .color = c },
+                .{ .pos = .{ ix.add(iw), iy, math.Unit.ZERO }, .color = c },
+                .{ .pos = .{ ix.add(iw), iy.add(ih), math.Unit.ZERO }, .color = c },
+                .{ .pos = .{ ix, iy.add(ih), math.Unit.ZERO }, .color = c },
             });
             try self.indices.appendSlice(self.alloc, &.{
                 b, b + 3, b + 2,

@@ -1,126 +1,131 @@
+const std = @import("std");
+const math = @import("math.zig");
+const Unit = math.Unit;
+
 pub const Config = struct {
-    gravity: f32 = 9.8,
-    jump_speed: f32 = 5.0,
-    max_speed: f32 = 6.0,
-    air_speed: f32 = 1.0,
-    accel: f32 = 50.0,
-    friction: f32 = 6.0,
-    slope_limit: f32 = 0.707,
+    gravity: Unit = Unit.fix(9.8),
+    jump_speed: Unit = Unit.fix(5.0),
+    max_speed: Unit = Unit.fix(6.0),
+    air_speed: Unit = Unit.fix(1.0),
+    accel: Unit = Unit.fix(50.0),
+    friction: Unit = Unit.fix(6.0),
+    slope_limit: Unit = Unit.fix(0.707),
     max_slides: u32 = 4,
-    radius: f32 = 0.3,
-    eye_height: f32 = 0.6,
-    ground_snap: f32 = 0.05,
+    radius: Unit = Unit.fix(0.3),
+    ground_snap: Unit = Unit.fix(0.05),
 };
 
-pub fn Body(comptime cfg: Config) type {
-    return struct {
-        const Self = @This();
-        const V3 = @Vector(3, f32);
+pub const Flags = packed struct(u8) {
+    grounded: bool = false,
+    _pad: u7 = 0,
+};
 
-        pos: [3]f32 = .{ 0, 0, 0 },
-        vel: [3]f32 = .{ 0, 0, 0 },
-        yaw: f32 = 0,
-        pitch: f32 = 0,
-        grounded: bool = false,
+pub const InputState = struct { wish: [3]Unit, jump: bool };
 
-        pub fn eyePos(self: Self) [3]f32 {
-            return .{ self.pos[0], self.pos[1] + cfg.eye_height, self.pos[2] };
-        }
+pub const System = struct {
+    pos: std.ArrayListUnmanaged([3]Unit) = .{},
+    vel: std.ArrayListUnmanaged([3]Unit) = .{},
+    angles: std.ArrayListUnmanaged(math.Angle) = .{},
+    flags: std.ArrayListUnmanaged(Flags) = .{},
+    alloc: std.mem.Allocator,
 
-        pub fn lookDir(self: Self) [3]f32 {
-            const f = .{
-                @sin(self.yaw) * @cos(self.pitch),
-                -@sin(self.pitch),
-                -@cos(self.yaw) * @cos(self.pitch),
-            };
-            const l = @sqrt(f[0] * f[0] + f[1] * f[1] + f[2] * f[2]);
-            return .{ f[0] / l, f[1] / l, f[2] / l };
-        }
+    pub fn init(alloc: std.mem.Allocator) System {
+        return .{ .alloc = alloc };
+    }
 
-        pub fn step(self: *Self, world: anytype, wish: [3]f32, jump: bool, dt: f32) void {
-            self.grounded = false;
-            var g_norm: [3]f32 = .{ 0, 1, 0 };
+    pub fn deinit(self: *System) void {
+        self.pos.deinit(self.alloc);
+        self.vel.deinit(self.alloc);
+        self.angles.deinit(self.alloc);
+        self.flags.deinit(self.alloc);
+    }
 
-            if (world.trace(self.pos, .{ 0, -1, 0 }, cfg.ground_snap, cfg.radius)) |h| {
-                if (h.normal[1] > cfg.slope_limit) {
-                    self.grounded = true;
+    pub fn add(self: *System, p: [3]Unit) !u32 {
+        const id: u32 = @intCast(self.pos.items.len);
+        try self.pos.append(self.alloc, p);
+        try self.vel.append(self.alloc, .{ Unit.ZERO, Unit.ZERO, Unit.ZERO });
+        try self.angles.append(self.alloc, .{});
+        try self.flags.append(self.alloc, .{});
+        return id;
+    }
+
+    pub fn step(self: *System, world: anytype, inputs: []const InputState, dt: Unit, cfg: Config) void {
+        for (self.pos.items, self.vel.items, self.flags.items, inputs) |*p, *v, *f, in| {
+            f.grounded = false;
+            var g_norm = [3]Unit{ Unit.ZERO, Unit.ONE, Unit.ZERO };
+
+            if (world.trace(p.*, .{ Unit.ZERO, Unit.ONE.neg(), Unit.ZERO }, cfg.ground_snap, cfg.radius)) |h| {
+                if (h.normal[1].v > cfg.slope_limit.v) {
+                    f.grounded = true;
                     g_norm = h.normal;
                 }
             }
 
-            if (self.grounded) {
-                const vn = @reduce(.Add, @as(V3, self.vel) * @as(V3, g_norm));
-                if (vn < 0) {
-                    self.vel = @as([3]f32, @as(V3, self.vel) - @as(V3, g_norm) * @as(V3, @splat(vn)));
+            if (f.grounded) {
+                const vn = Unit.dot3(v.*, g_norm);
+                if (vn.v < 0) {
+                    v.* = Unit.sub3(v.*, Unit.scale3(g_norm, vn));
                 }
-
-                const spd = @sqrt(self.vel[0] * self.vel[0] + self.vel[2] * self.vel[2]);
-                if (spd > 0.1) {
-                    const f = @max(0, spd - spd * cfg.friction * dt) / spd;
-                    self.vel[0] *= f;
-                    self.vel[2] *= f;
+                const spd = Unit.len3(.{ v[0], Unit.ZERO, v[2] });
+                if (spd.v > 102) { // > 0.1
+                    const drop = spd.mul(cfg.friction.mul(dt));
+                    const sf = Unit.raw(@max(0, spd.v - drop.v)).div(spd);
+                    v[0] = v[0].mul(sf);
+                    v[2] = v[2].mul(sf);
                 } else {
-                    self.vel[0] = 0;
-                    self.vel[2] = 0;
+                    v[0] = Unit.ZERO;
+                    v[2] = Unit.ZERO;
                 }
             } else {
-                self.vel[1] -= cfg.gravity * dt;
+                v[1] = v[1].sub(cfg.gravity.mul(dt));
             }
 
-            if (jump and self.grounded) {
-                self.vel[1] = cfg.jump_speed;
-                self.grounded = false;
+            if (in.jump and f.grounded) {
+                v[1] = cfg.jump_speed;
+                f.grounded = false;
             }
 
-            const wl = @sqrt(wish[0] * wish[0] + wish[2] * wish[2]);
-            if (wl > 0) {
-                const wn: V3 = @as(V3, wish) / @as(V3, @splat(wl));
-                const top = if (self.grounded) cfg.max_speed * wl else @min(cfg.max_speed * wl, cfg.air_speed);
-                const cur = @reduce(.Add, @as(V3, .{ self.vel[0], 0, self.vel[2] }) * wn);
-                const add = @min(cfg.accel * dt, @max(0, top - cur));
-                self.vel = @as([3]f32, @as(V3, self.vel) + wn * @as(V3, @splat(add)));
+            const wl = Unit.len3(in.wish);
+            if (wl.v > 0) {
+                const top = if (f.grounded) cfg.max_speed.mul(wl) else Unit.raw(@min(cfg.max_speed.mul(wl).v, cfg.air_speed.v));
+                const cur = Unit.dot3(.{ v[0], Unit.ZERO, v[2] }, in.wish);
+                const add_spd = Unit.raw(@min(cfg.accel.mul(dt).v, @max(0, top.v - cur.v)));
+                v.* = Unit.add3(v.*, Unit.scale3(in.wish, add_spd));
             }
 
-            var rem = @as(V3, self.vel) * @as(V3, @splat(dt));
+            var rem = Unit.scale3(v.*, dt);
 
             for (0..cfg.max_slides) |_| {
-                const l = @sqrt(@reduce(.Add, rem * rem));
-                if (l < 1e-5) {
-                    break;
-                }
+                const l = Unit.len3(rem);
+                if (l.v < 2) break;
 
-                const dir: [3]f32 = @as([3]f32, rem / @as(V3, @splat(l)));
-                const trace_res = world.trace(self.pos, dir, l + 1e-3, cfg.radius);
+                const dir = Unit.norm3(rem);
+                const trace_res = world.trace(p.*, dir, l.add(Unit.raw(1)), cfg.radius);
 
                 if (trace_res) |h| {
-                    const md = @max(0, h.dist - 1e-5);
-                    if (md > 0) {
-                        self.pos = @as([3]f32, @as(V3, self.pos) + @as(V3, dir) * @as(V3, @splat(md)));
-                        rem -= @as(V3, dir) * @as(V3, @splat(@min(md, l)));
+                    const md = Unit.raw(@max(0, h.dist.v - 1));
+                    if (md.v > 0) {
+                        p.* = Unit.add3(p.*, Unit.scale3(dir, md));
+                        rem = Unit.sub3(rem, Unit.scale3(dir, Unit.raw(@min(md.v, l.v))));
                     }
-
-                    self.pos = @as([3]f32, @as(V3, self.pos) + @as(V3, h.normal) * @as(V3, @splat(1e-3)));
+                    
+                    // Add 1/1024 padding
+                    p.* = Unit.add3(p.*, Unit.scale3(h.normal, Unit.raw(1)));
                     rem = clip(rem, h.normal);
-                    self.vel = clip(@as(V3, self.vel), h.normal);
+                    v.* = clip(v.*, h.normal);
                 } else {
-                    self.pos = @as([3]f32, @as(V3, self.pos) + rem);
+                    p.* = Unit.add3(p.*, rem);
                     break;
                 }
             }
         }
+    }
 
-        fn clip(in: V3, n_arr: [3]f32) [3]f32 {
-            const n: V3 = n_arr;
-            const b = @reduce(.Add, in * n);
-            if (b >= 0) {
-                return @as([3]f32, in);
-            }
-            const o = in - n * @as(V3, @splat(b));
-            const r = @reduce(.Add, o * n);
-            if (r < 0) {
-                return @as([3]f32, o - n * @as(V3, @splat(r)));
-            }
-            return @as([3]f32, o);
-        }
-    };
-}
+    fn clip(in: [3]Unit, n: [3]Unit) [3]Unit {
+        const b = Unit.dot3(in, n);
+        if (b.v >= 0) return in;
+        const o = Unit.sub3(in, Unit.scale3(n, b));
+        const r = Unit.dot3(o, n);
+        return if (r.v < 0) Unit.sub3(o, Unit.scale3(n, r)) else o;
+    }
+};

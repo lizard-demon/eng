@@ -1,9 +1,11 @@
 const std = @import("std");
 const sdl = @import("sdl3");
 const gpu = sdl.gpu;
+const math = @import("math.zig");
 
+// Seamlessly maps [3]math.Unit layout to the GPU's .i32x3 integers
 pub const Vertex = extern struct {
-    pos: [3]f32,
+    pos: [3]math.Unit,
     color: [4]f32,
 };
 
@@ -68,7 +70,7 @@ pub const Renderer = struct {
         const attr_pos = gpu.VertexAttribute{
             .location = 0,
             .buffer_slot = 0,
-            .format = .f32x3,
+            .format = .i32x3,
             .offset = @offsetOf(Vertex, "pos"),
         };
 
