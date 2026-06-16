@@ -1,86 +1,284 @@
-//! gfx.zig — Renderer(Gpu): comptime-monomorphised 3D rendering
-//!
-//! Gpu backend contract:
-//!   const Handle: type
-//!   fn beginFrame(*Self) !bool
-//!   fn endFrame(*Self) !void
-//!   fn upload(*Self, verts: []const u8, v_size: u32, indices: []const u8, i_count: u32) !Handle
-//!   fn release(*Self, Handle) void
-//!   fn draw(*Self, Handle, mvp: Mat4, color: [4]f32) void
-
+const std = @import("std");
+const sdl = @import("sdl3");
+const gpu = sdl.gpu;
 const math = @import("math.zig");
-const geo = @import("geo.zig");
-const Vec3 = math.Vec3;
-const Mat4 = math.Mat4;
 
-/// Standard interleaved vertex: position + color.
-/// Fragment shader derives normals via dFdx/dFdy of world_pos.
 pub const Vertex = extern struct {
-    pos: [3]f32,
+    pos: [3]math.Unit,
     color: [4]f32,
 };
 
-pub fn Renderer(comptime Gpu: type) type {
-    const required = .{ "beginFrame", "endFrame", "upload", "release", "draw" };
-    inline for (required) |name| {
-        if (!@hasDecl(Gpu, name))
-            @compileError("Gpu backend missing '" ++ name ++ "'");
+const MeshSlot = struct {
+    vbo: gpu.Buffer,
+    ibo: gpu.Buffer,
+    idx_count: u32,
+};
+
+pub const Renderer = struct {
+    pub const Handle = u32;
+
+    device: gpu.Device,
+    window: sdl.video.Window,
+    pipe_3d: gpu.GraphicsPipeline,
+    pipe_2d: gpu.GraphicsPipeline,
+    depth_tex: ?gpu.Texture = null,
+    width: u32 = 0,
+    height: u32 = 0,
+    meshes: std.ArrayListUnmanaged(MeshSlot) = .{},
+    alloc: std.mem.Allocator,
+    cmd: ?gpu.CommandBuffer = null,
+    render_pass: ?gpu.RenderPass = null,
+    swapchain_tex: ?gpu.Texture = null,
+    clear_color: [4]f32 = .{ 0.06, 0.07, 0.12, 1.0 },
+
+    pub fn init(device: gpu.Device, window: sdl.video.Window, alloc: std.mem.Allocator, vert_spv: []const u8, frag_spv: []const u8) !Renderer {
+        try device.claimWindow(window);
+        const sc_fmt = try device.getSwapchainTextureFormat(window);
+
+        const supports_depth32 = device.textureSupportsFormat(
+            .depth32_float,
+            .two_dimensional,
+            .{ .depth_stencil_target = true }
+        );
+        const depth_fmt: gpu.TextureFormat = if (supports_depth32) .depth32_float else .depth16_unorm;
+
+        const vert_shader = try device.createShader(.{
+            .code = vert_spv,
+            .entry_point = "main",
+            .format = .{ .spirv = true },
+            .stage = .vertex,
+            .num_uniform_buffers = 1,
+        });
+        defer device.releaseShader(vert_shader);
+
+        const frag_shader = try device.createShader(.{
+            .code = frag_spv,
+            .entry_point = "main",
+            .format = .{ .spirv = true },
+            .stage = .fragment,
+        });
+        defer device.releaseShader(frag_shader);
+
+        const vert_desc = gpu.VertexBufferDescription{
+            .slot = 0,
+            .pitch = @sizeOf(Vertex),
+            .input_rate = .vertex,
+        };
+
+        const attr_pos = gpu.VertexAttribute{
+            .location = 0,
+            .buffer_slot = 0,
+            .format = .i32x3,
+            .offset = @offsetOf(Vertex, "pos"),
+        };
+
+        const attr_col = gpu.VertexAttribute{
+            .location = 1,
+            .buffer_slot = 0,
+            .format = .f32x4,
+            .offset = @offsetOf(Vertex, "color"),
+        };
+
+        const target_desc = gpu.ColorTargetDescription{
+            .format = sc_fmt,
+        };
+
+        var pipe_info = gpu.GraphicsPipelineCreateInfo{
+            .vertex_shader = vert_shader,
+            .fragment_shader = frag_shader,
+            .vertex_input_state = .{
+                .vertex_buffer_descriptions = &.{vert_desc},
+                .vertex_attributes = &.{ attr_pos, attr_col },
+            },
+            .rasterizer_state = .{
+                .cull_mode = .back,
+                .front_face = .counter_clockwise,
+            },
+            .depth_stencil_state = .{
+                .compare = .less_or_equal,
+                .enable_depth_test = true,
+                .enable_depth_write = true,
+            },
+            .target_info = .{
+                .color_target_descriptions = &.{target_desc},
+                .depth_stencil_format = depth_fmt,
+            },
+        };
+
+        const pipe_3d = try device.createGraphicsPipeline(pipe_info);
+
+        pipe_info.depth_stencil_state.enable_depth_test = false;
+        pipe_info.depth_stencil_state.enable_depth_write = false;
+        pipe_info.rasterizer_state.cull_mode = .none;
+
+        const pipe_2d = try device.createGraphicsPipeline(pipe_info);
+
+        return .{
+            .device = device,
+            .window = window,
+            .pipe_3d = pipe_3d,
+            .pipe_2d = pipe_2d,
+            .alloc = alloc,
+        };
     }
 
-    return struct {
-        const Self = @This();
-        pub const Handle = Gpu.Handle;
+    pub fn deinit(self: *Renderer) void {
+        self.device.waitForIdle() catch {};
 
-        gpu: Gpu,
-        view: Mat4 = Mat4.identity(),
-        proj: Mat4 = Mat4.identity(),
-        frust: geo.Frustum = undefined,
-
-        pub fn init(gpu: Gpu) Self { return .{ .gpu = gpu }; }
-
-        pub fn camera(self: *Self, eye: Vec3, target: Vec3, world_up: Vec3, fovy: f32, aspect: f32, near: f32, far: f32) void {
-            self.view = Mat4.lookAt(eye, target, world_up);
-            self.proj = math.perspective(fovy, aspect, near, far);
-            const fwd = target.sub(eye).normalize();
-            const rt = fwd.cross(world_up).normalize();
-            const up = rt.cross(fwd);
-            self.frust = geo.Frustum.fromCamera(eye, fwd, rt, up, fovy * 3.14159 / 180.0, aspect, near, far);
+        for (self.meshes.items) |m| {
+            self.device.releaseBuffer(m.vbo);
+            self.device.releaseBuffer(m.ibo);
         }
 
-        /// Optimised: set view from Euler angles, avoids trig twice.
-        pub fn cameraEuler(self: *Self, pos: Vec3, yaw: f32, pitch: f32, eye_height: f32, fovy: f32, aspect: f32, near: f32, far: f32) void {
-            self.view = Mat4.viewMatrix(pos, yaw, pitch, eye_height);
-            self.proj = math.perspective(fovy, aspect, near, far);
-            const sp = @sin(pitch);
-            const cp = @cos(pitch);
-            const sy = @sin(yaw);
-            const cy = @cos(yaw);
-            const eye = pos.add(Vec3.new(0, eye_height, 0));
-            const fwd = Vec3.new(sy * cp, -sp, -cy * cp).normalize(); // -sp
-            const rt  = Vec3.new(cy, 0, sy);
-            const up  = rt.cross(fwd);
-            self.frust = geo.Frustum.fromCamera(eye, fwd, rt, up, fovy * 3.14159 / 180.0, aspect, near, far);
+        self.meshes.deinit(self.alloc);
+
+        if (self.depth_tex) |t| {
+            self.device.releaseTexture(t);
         }
 
-        pub fn beginFrame(self: *Self) !bool { return self.gpu.beginFrame(); }
-        pub fn endFrame(self: *Self) !void { return self.gpu.endFrame(); }
+        self.device.releaseGraphicsPipeline(self.pipe_3d);
+        self.device.releaseGraphicsPipeline(self.pipe_2d);
+        self.device.releaseWindow(self.window);
+        self.device.deinit();
+    }
 
-        pub fn upload(self: *Self, verts: []const u8, v_size: u32, indices: []const u8, i_count: u32) !Handle {
-            return self.gpu.upload(verts, v_size, indices, i_count);
+    pub fn beginFrame(self: *Renderer) !bool {
+        self.cmd = try self.device.acquireCommandBuffer();
+
+        const tex, const w, const h = try self.cmd.?.waitAndAcquireSwapchainTexture(self.window);
+        self.swapchain_tex = tex orelse return false;
+
+        if (w != self.width or h != self.height or self.depth_tex == null) {
+            self.width = w;
+            self.height = h;
+
+            if (self.depth_tex) |dt| {
+                self.device.releaseTexture(dt);
+            }
+
+            const supports_depth32 = self.device.textureSupportsFormat(
+                .depth32_float,
+                .two_dimensional,
+                .{ .depth_stencil_target = true }
+            );
+
+            self.depth_tex = try self.device.createTexture(.{
+                .format = if (supports_depth32) .depth32_float else .depth16_unorm,
+                .usage = .{ .depth_stencil_target = true },
+                .width = w,
+                .height = h,
+                .layer_count_or_depth = 1,
+                .num_levels = 1,
+            });
         }
 
-        pub fn release(self: *Self, h: Handle) void { self.gpu.release(h); }
+        const color_target = gpu.ColorTargetInfo{
+            .texture = self.swapchain_tex.?,
+            .clear_color = .{
+                .r = self.clear_color[0],
+                .g = self.clear_color[1],
+                .b = self.clear_color[2],
+                .a = self.clear_color[3],
+            },
+            .load = .clear,
+            .store = .store,
+        };
 
-        /// Frustum-culled draw.
-        pub fn draw(self: *Self, handle: Handle, model: Mat4, box: math.AABB, color: [4]f32) void {
-            if (!self.frust.containsAABB(box)) return;
-            const mvp = self.proj.mul(self.view).mul(model);
-            self.gpu.draw(handle, mvp, color);
-        }
+        const depth_target = gpu.DepthStencilTargetInfo{
+            .texture = self.depth_tex.?,
+            .clear_depth = 1.0,
+            .load = .clear,
+            .store = .do_not_care,
+            .stencil_load = .do_not_care,
+            .stencil_store = .do_not_care,
+            .cycle = false,
+            .clear_stencil = 0,
+        };
 
-        /// Draw without culling (skybox, HUD).
-        pub fn drawDirect(self: *Self, handle: Handle, model: Mat4, color: [4]f32) void {
-            self.gpu.draw(handle, self.proj.mul(self.view).mul(model), color);
+        self.render_pass = self.cmd.?.beginRenderPass(&.{color_target}, depth_target);
+
+        return true;
+    }
+
+    pub fn endFrame(self: *Renderer) !void {
+        if (self.render_pass) |rp| {
+            rp.end();
         }
-    };
-}
+        self.render_pass = null;
+
+        if (self.cmd) |cmd| {
+            try cmd.submit();
+        }
+        self.cmd = null;
+    }
+
+    fn uploadBuffer(device: gpu.Device, data: []const u8, usage: gpu.BufferUsageFlags) !gpu.Buffer {
+        const buf = try device.createBuffer(.{ .usage = usage, .size = @intCast(data.len) });
+        const tbuf = try device.createTransferBuffer(.{ .usage = .upload, .size = @intCast(data.len) });
+
+        const ptr = try device.mapTransferBuffer(tbuf, false);
+        @memcpy(ptr[0..data.len], data);
+        device.unmapTransferBuffer(tbuf);
+
+        const cmd = try device.acquireCommandBuffer();
+        const copy = cmd.beginCopyPass();
+
+        copy.uploadToBuffer(
+            .{ .transfer_buffer = tbuf, .offset = 0 },
+            .{ .buffer = buf, .offset = 0, .size = @intCast(data.len) },
+            false
+        );
+
+        copy.end();
+        try cmd.submit();
+        try device.waitForIdle();
+
+        device.releaseTransferBuffer(tbuf);
+        return buf;
+    }
+
+    pub fn upload(self: *Renderer, vert_bytes: []const u8, v_size: u32, idx_bytes: []const u8, i_count: u32) !Handle {
+        _ = v_size;
+        const h: Handle = @intCast(self.meshes.items.len);
+
+        try self.meshes.append(self.alloc, .{
+            .vbo = try uploadBuffer(self.device, vert_bytes, .{ .vertex = true }),
+            .ibo = try uploadBuffer(self.device, idx_bytes, .{ .index = true }),
+            .idx_count = i_count,
+        });
+
+        return h;
+    }
+
+    pub fn updateMesh(self: *Renderer, handle: Handle, vert_bytes: []const u8, idx_bytes: []const u8, i_count: u32) !void {
+        if (handle >= self.meshes.items.len) return;
+
+        const new_vbo = try uploadBuffer(self.device, vert_bytes, .{ .vertex = true });
+        const new_ibo = try uploadBuffer(self.device, idx_bytes, .{ .index = true });
+
+        self.device.releaseBuffer(self.meshes.items[handle].vbo);
+        self.device.releaseBuffer(self.meshes.items[handle].ibo);
+
+        self.meshes.items[handle] = .{
+            .vbo = new_vbo,
+            .ibo = new_ibo,
+            .idx_count = i_count,
+        };
+    }
+
+    pub fn draw(self: *Renderer, handle: Handle, mvp: [16]f32, is_overlay: bool) void {
+        if (handle >= self.meshes.items.len) return;
+
+        const m = self.meshes.items[handle];
+        if (m.idx_count == 0) return;
+
+        const rp = self.render_pass orelse return;
+
+        rp.bindGraphicsPipeline(if (is_overlay) self.pipe_2d else self.pipe_3d);
+        rp.bindVertexBuffers(0, &.{.{ .buffer = m.vbo, .offset = 0 }});
+        rp.bindIndexBuffer(.{ .buffer = m.ibo, .offset = 0 }, .indices_32bit);
+
+        self.cmd.?.pushVertexUniformData(0, std.mem.asBytes(&mvp));
+        rp.drawIndexedPrimitives(m.idx_count, 1, 0, 0, 0);
+    }
+};

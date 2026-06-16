@@ -2,18 +2,16 @@ const std = @import("std");
 const sdl = @import("sdl3");
 const gpu = sdl.gpu;
 
-const fmwk = @import("fmwk/math.zig");
-const gfx = @import("fmwk/gfx.zig");
-const input = @import("fmwk/input.zig");
-const bsp_tree = @import("fmwk/bsp/tree.zig");
-const bsp_mesher = @import("fmwk/bsp/mesher.zig");
+const fmwk = @import("engine");
+const gfx = fmwk.gfx;
+const input = fmwk.input;
 
 const phys = @import("phys.zig");
 const ui = @import("ui.zig");
 
-const Unit = fmwk.Unit;
-const Tree = bsp_tree.Tree;
-const Mesher = bsp_mesher.Mesher;
+const Unit = fmwk.math.Unit;
+const Tree = fmwk.bsp.tree.Tree;
+const Mesher = fmwk.bsp.mesher.Mesher;
 
 pub const App = struct {
     const Ui = ui.UiState(gfx.Vertex);
@@ -42,11 +40,14 @@ pub const App = struct {
         const win = try sdl.video.Window.init("Runtime Engine", 1280, 720, .{});
         const device = try gpu.Device.init(.{ .spirv = true }, true, null);
 
+        const vert_spv = @embedFile("shaders/triangle.vert.spv");
+        const frag_spv = @embedFile("shaders/triangle.frag.spv");
+
         var app = App{
             .alloc = alloc,
             .win = win,
             .device = device,
-            .renderer = try gfx.Renderer.init(device, win, alloc),
+            .renderer = try gfx.Renderer.init(device, win, alloc, vert_spv, frag_spv),
             .level_tree = Tree.init(alloc),
             .level_mesher = LevelMesher.init(alloc),
             .gui = Ui.init(alloc),

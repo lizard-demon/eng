@@ -1,5 +1,5 @@
 const std = @import("std");
-const math = @import("fmwk/math.zig");
+const math = @import("engine").math;
 
 const font: [128][5]u8 = init: {
     var f = [_][5]u8{.{ 0, 0, 0, 0, 0 }} ** 128;

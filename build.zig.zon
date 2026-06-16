@@ -3,7 +3,12 @@
     .version = "0.0.1",
     .fingerprint = 0xe8a81a8db6b97ad5,
     .minimum_zig_version = "0.15.2",
-    .dependencies = .{},
+    .dependencies = .{
+        .sdl3 = .{
+            .url = "git+https://codeberg.org/7Games/zig-sdl3?ref=v0.1.9#45ffa097ad183a72f81d42f9f8c0df0398663814",
+            .hash = "sdl3-0.1.9-NmT1Q2k0JwAtPRns9E3OO6qpqpvy8mn80guJ8L209AtI",
+        },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",

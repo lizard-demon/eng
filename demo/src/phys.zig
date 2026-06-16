@@ -1,5 +1,6 @@
 const std = @import("std");
-const math = @import("fmwk/math.zig");
+const engine = @import("engine");
+const math = engine.math;
 const Unit = math.Unit;
 
 pub const Config = struct {

@@ -39,9 +39,9 @@ pub fn build(b: *std.Build) void {
         const glslc = b.addSystemCommand(&.{
             "glslc",
             "-fshader-stage=" ++ s.stage,
-            "src/fmwk/shaders/" ++ s.name ++ ".glsl",
+            "src/shaders/" ++ s.name ++ ".glsl",
             "-o",
-            "src/fmwk/shaders/" ++ s.name ++ ".spv",
+            "src/shaders/" ++ s.name ++ ".spv",
         });
         glslc.setCwd(b.path("."));
         // Exe compilation depends on shaders existing for @embedFile.
