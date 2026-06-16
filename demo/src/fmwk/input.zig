@@ -45,7 +45,6 @@ pub const Input = struct {
         self.mouse_held[3] = mstate[0].side1;
         self.mouse_held[4] = mstate[0].side2;
         
-        // Truncate sub-pixel floating point input states down to pure integer
         self.mouse_x = @intFromFloat(mstate[1]);
         self.mouse_y = @intFromFloat(mstate[2]);
 

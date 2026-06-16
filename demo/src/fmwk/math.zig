@@ -38,8 +38,6 @@ pub const Unit = extern struct {
         };
     }
 
-    // Exact 64-bit integer algebraic interpolation
-    // Prevents clipping plane intersections from quantizing along massive polygon edges
     pub inline fn lerp(a: [3]Unit, b: [3]Unit, num: i32, den: i32) [3]Unit {
         if (den == 0) return a;
         return .{

@@ -1,5 +1,5 @@
 const std = @import("std");
-const math = @import("math.zig");
+const math = @import("fmwk/math.zig");
 
 const font: [128][5]u8 = init: {
     var f = [_][5]u8{.{ 0, 0, 0, 0, 0 }} ** 128;
@@ -171,9 +171,9 @@ pub fn UiState(comptime Vertex: type) type {
 
         pub fn textAt(self: *Self, x: f32, y: f32, str: []const u8, scale: f32, color: [4]f32) !void {
             var ox = x;
-            for (str) |c| {
-                if (c < 128) {
-                    for (font[c], 0..) |row, py| {
+            for (str) |char| {
+                if (char < 128) {
+                    for (font[char], 0..) |row, py| {
                         for (0..5) |px| {
                             const bit = (row >> @as(u3, @intCast(4 - px))) & 1;
                             if (bit != 0) {

@@ -118,10 +118,7 @@ pub const Tree = struct {
             if (num > den) num = den;
         }
 
-        // Interpolate the fraction metadata precisely
         const midf = Unit.raw(p1f.v + @as(i32, @intCast(if (den == 0) 0 else @divTrunc(@as(i64, p2f.v - p1f.v) * num, den))));
-        
-        // Exact algebraic intersection
         const mid = Unit.lerp(p1, p2, num, den);
 
         if (!self.traceRec(near, p1f, midf, p1, mid, rad, st)) return false;

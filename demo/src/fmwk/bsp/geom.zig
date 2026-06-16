@@ -53,7 +53,6 @@ pub const Poly = struct {
                     out.len += 1;
                 }
                 if (db.v < -1 and out.len < 48) {
-                    // Replaced low-precision unit quantization with exact interpolation
                     out.verts[out.len] = Unit.lerp(a, b, da.v, da.v - db.v);
                     out.len += 1;
                 }
@@ -100,7 +99,6 @@ pub const Poly = struct {
             }
 
             if ((d1.v > 1 and d2.v < -1) or (d1.v < -1 and d2.v > 1)) {
-                // Exact interpolation
                 const mid = Unit.lerp(p1, p2, d1.v, d1.v - d2.v);
                 
                 if (res.f.len < 48) { res.f.verts[res.f.len] = mid; res.f.len += 1; }

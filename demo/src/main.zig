@@ -2,16 +2,18 @@ const std = @import("std");
 const sdl = @import("sdl3");
 const gpu = sdl.gpu;
 
-const math = @import("fmwk/math.zig");
-const phys = @import("fmwk/phys.zig");
+const fmwk = @import("fmwk/math.zig");
 const gfx = @import("fmwk/gfx.zig");
-const ui = @import("fmwk/ui.zig");
 const input = @import("fmwk/input.zig");
+const bsp_tree = @import("fmwk/bsp/tree.zig");
+const bsp_mesher = @import("fmwk/bsp/mesher.zig");
 
-const Unit = math.Unit;
+const phys = @import("phys.zig");
+const ui = @import("ui.zig");
 
-const Tree = @import("fmwk/bsp/tree.zig").Tree;
-const Mesher = @import("fmwk/bsp/mesher.zig").Mesher;
+const Unit = fmwk.Unit;
+const Tree = bsp_tree.Tree;
+const Mesher = bsp_mesher.Mesher;
 
 pub const App = struct {
     const Ui = ui.UiState(gfx.Vertex);
@@ -21,60 +23,41 @@ pub const App = struct {
     win: sdl.video.Window,
     device: gpu.Device,
     renderer: gfx.Renderer,
-    
+
     level_tree: Tree,
     level_mesher: LevelMesher,
-    
+    mesh_h: gfx.Renderer.Handle = 0,
+    ui_mesh_h: ?gfx.Renderer.Handle = null,
+
     gui: Ui,
     in: input.Input,
-    
+
     physics: phys.System,
     player_id: u32 = 0,
-    
-    mesh_h: gfx.Renderer.Handle = 0,
+
     running: bool = true,
 
     pub fn init(alloc: std.mem.Allocator) !App {
         try sdl.init(.{ .video = true, .events = true });
-
         const win = try sdl.video.Window.init("Runtime Engine", 1280, 720, .{});
         const device = try gpu.Device.init(.{ .spirv = true }, true, null);
 
-        var tree = Tree.init(alloc);
-        try tree.initGroundPlane(Unit.ZERO);
-        
-        try tree.split(.{ Unit.ZERO, Unit.ZERO, Unit.fix(10) }, .{ Unit.ZERO, Unit.ZERO, Unit.ONE.neg() }, .solid);
-        try tree.split(.{ Unit.ZERO, Unit.ZERO, Unit.fix(-10) }, .{ Unit.ZERO, Unit.ZERO, Unit.ONE }, .solid);
-        try tree.split(.{ Unit.fix(10), Unit.ZERO, Unit.ZERO }, .{ Unit.ONE.neg(), Unit.ZERO, Unit.ZERO }, .solid);
-        try tree.split(.{ Unit.fix(-10), Unit.ZERO, Unit.ZERO }, .{ Unit.ONE, Unit.ZERO, Unit.ZERO }, .solid);
-        
-        var mesher = LevelMesher.init(alloc);
-        try mesher.build(&tree);
-
-        var renderer = try gfx.Renderer.init(device, win, alloc);
-        const mh = try renderer.upload(
-            std.mem.sliceAsBytes(mesher.verts.items),
-            @sizeOf(gfx.Vertex),
-            std.mem.sliceAsBytes(mesher.indices.items),
-            @intCast(mesher.indices.items.len)
-        );
-
-        var physics = phys.System.init(alloc);
-        const player_id = try physics.add(.{ Unit.ZERO, Unit.fix(1.5), Unit.ZERO });
-
-        return .{
+        var app = App{
             .alloc = alloc,
             .win = win,
             .device = device,
-            .renderer = renderer,
-            .level_tree = tree,
-            .level_mesher = mesher,
+            .renderer = try gfx.Renderer.init(device, win, alloc),
+            .level_tree = Tree.init(alloc),
+            .level_mesher = LevelMesher.init(alloc),
             .gui = Ui.init(alloc),
             .in = input.Input.init(),
-            .physics = physics,
-            .player_id = player_id,
-            .mesh_h = mh,
+            .physics = phys.System.init(alloc),
         };
+
+        try app.buildLevel();
+        try app.initPlayer();
+
+        return app;
     }
 
     pub fn deinit(self: *App) void {
@@ -87,32 +70,56 @@ pub const App = struct {
         sdl.quit(.{ .video = true, .events = true });
     }
 
+    fn buildLevel(self: *App) !void {
+        try self.level_tree.initGroundPlane(Unit.ZERO);
+        try self.level_tree.split(.{ Unit.ZERO, Unit.ZERO, Unit.fix(10) }, .{ Unit.ZERO, Unit.ZERO, Unit.ONE.neg() }, .solid);
+        try self.level_tree.split(.{ Unit.ZERO, Unit.ZERO, Unit.fix(-10) }, .{ Unit.ZERO, Unit.ZERO, Unit.ONE }, .solid);
+        try self.level_tree.split(.{ Unit.fix(10), Unit.ZERO, Unit.ZERO }, .{ Unit.ONE.neg(), Unit.ZERO, Unit.ZERO }, .solid);
+        try self.level_tree.split(.{ Unit.fix(-10), Unit.ZERO, Unit.ZERO }, .{ Unit.ONE, Unit.ZERO, Unit.ZERO }, .solid);
+        
+        try self.level_mesher.build(&self.level_tree);
+
+        self.mesh_h = try self.renderer.upload(
+            std.mem.sliceAsBytes(self.level_mesher.verts.items),
+            @sizeOf(gfx.Vertex),
+            std.mem.sliceAsBytes(self.level_mesher.indices.items),
+            @intCast(self.level_mesher.indices.items.len)
+        );
+    }
+
+    fn initPlayer(self: *App) !void {
+        self.player_id = try self.physics.add(.{ Unit.ZERO, Unit.fix(1.5), Unit.ZERO });
+    }
+
     pub fn update(self: *App) !void {
         self.in.update();
+        if (self.in.quit) self.running = false;
 
-        if (self.in.quit) {
-            self.running = false;
+        self.handleInput();
+        self.updatePhysics();
+        try self.updateUi();
+    }
+
+    fn handleInput(self: *App) void {
+        if (self.in.keyPressed(.escape) and self.in.mouse_locked) {
+            self.in.setLock(self.win, false);
         }
 
-        if (self.in.keyPressed(.escape)) {
-            if (self.in.mouse_locked) {
-                self.in.setLock(self.win, false);
-            }
+        if (!self.in.mouse_locked and self.in.mousePressed(.left) and self.gui.hot == 0) {
+            self.in.setLock(self.win, true);
         }
+    }
 
+    fn updatePhysics(self: *App) void {
         if (self.in.mouse_locked) {
             self.physics.angles.items[self.player_id] = self.physics.angles.items[self.player_id]
                 .addY(self.in.mouse_dx * 30)
                 .addX(self.in.mouse_dy * 30)
-                .clampPitch(); // Encapsulated math function protects from flipping upside down
+                .clampPitch();
         }
 
-        var w_val = Unit.ZERO;
-        if (self.in.key(.w)) w_val = Unit.ONE else if (self.in.key(.s)) w_val = Unit.ONE.neg();
-
-        var d_val = Unit.ZERO;
-        if (self.in.key(.d)) d_val = Unit.ONE else if (self.in.key(.a)) d_val = Unit.ONE.neg();
-
+        const w_val = if (self.in.key(.w)) Unit.ONE else if (self.in.key(.s)) Unit.ONE.neg() else Unit.ZERO;
+        const d_val = if (self.in.key(.d)) Unit.ONE else if (self.in.key(.a)) Unit.ONE.neg() else Unit.ZERO;
         const wish_dir = self.physics.angles.items[self.player_id].wishdir(w_val, d_val);
         
         self.physics.step(
@@ -121,55 +128,37 @@ pub const App = struct {
             Unit.fix(1.0 / 60.0), 
             .{}
         );
+    }
 
+    fn updateUi(self: *App) !void {
         self.gui.begin(&self.in);
+        
         var hbuf: [128]u8 = undefined;
+        const pos = self.physics.pos.items[self.player_id];
         const info_str = try std.fmt.bufPrint(
-            &hbuf,
-            "POS: {d:.1} {d:.1} {d:.1}",
-            .{ 
-                self.physics.pos.items[self.player_id][0].flt(),
-                self.physics.pos.items[self.player_id][1].flt(), 
-                self.physics.pos.items[self.player_id][2].flt()
-            }
+            &hbuf, "POS: {d:.1} {d:.1} {d:.1}",
+            .{ pos[0].flt(), pos[1].flt(), pos[2].flt() }
         );
-
         try self.gui.textAt(10, 10, info_str, 2.0, .{ 0.9, 0.9, 0.4, 1.0 });
 
         if (self.in.mouse_locked) {
             try self.gui.crosshair(1280.0 / 2.0, 720.0 / 2.0, 8.0, .{ 1, 1, 1, 0.8 });
         } else {
             self.gui.cy = 40;
-            if (try self.gui.button(1, "RESUME", 3.0)) {
-                self.in.setLock(self.win, true);
-            }
-            if (try self.gui.button(2, "QUIT", 3.0)) {
-                self.running = false;
-            }
+            if (try self.gui.button(1, "RESUME", 3.0)) self.in.setLock(self.win, true);
+            if (try self.gui.button(2, "QUIT", 3.0)) self.running = false;
         }
         self.gui.end();
 
-        if (!self.in.mouse_locked and self.in.mousePressed(.left)) {
-            if (self.gui.hot == 0) {
-                self.in.setLock(self.win, true);
-            }
-        }
-
         if (self.gui.indices.items.len > 0) {
-            if (self.renderer.ui_handle) |h| {
-                try self.renderer.updateMesh(
-                    h,
-                    std.mem.sliceAsBytes(self.gui.verts.items),
-                    std.mem.sliceAsBytes(self.gui.indices.items),
-                    @intCast(self.gui.indices.items.len)
-                );
+            const v_bytes = std.mem.sliceAsBytes(self.gui.verts.items);
+            const i_bytes = std.mem.sliceAsBytes(self.gui.indices.items);
+            const i_count: u32 = @intCast(self.gui.indices.items.len);
+
+            if (self.ui_mesh_h) |h| {
+                try self.renderer.updateMesh(h, v_bytes, i_bytes, i_count);
             } else {
-                self.renderer.ui_handle = try self.renderer.upload(
-                    std.mem.sliceAsBytes(self.gui.verts.items),
-                    @sizeOf(gfx.Vertex),
-                    std.mem.sliceAsBytes(self.gui.indices.items),
-                    @intCast(self.gui.indices.items.len)
-                );
+                self.ui_mesh_h = try self.renderer.upload(v_bytes, @sizeOf(gfx.Vertex), i_bytes, i_count);
             }
         }
     }
@@ -183,13 +172,11 @@ pub const App = struct {
                 self.physics.pos.items[self.player_id], 
                 Unit.fix(0.6)
             );
-            const mvp = Unit.mulMat(p, v);
 
-            self.renderer.drawDirect(self.mesh_h, mvp);
+            self.renderer.draw(self.mesh_h, Unit.mulMat(p, v), false);
 
-            if (self.renderer.ui_handle) |h| {
-                const ortho = Unit.ortho(0, 1280.0, 720.0, 0, -1, 1);
-                self.renderer.drawUI(h, ortho);
+            if (self.ui_mesh_h) |h| {
+                self.renderer.draw(h, Unit.ortho(0, 1280.0, 720.0, 0, -1, 1), true);
             }
 
             try self.renderer.endFrame();

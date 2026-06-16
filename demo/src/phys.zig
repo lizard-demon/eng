@@ -1,5 +1,5 @@
 const std = @import("std");
-const math = @import("math.zig");
+const math = @import("fmwk/math.zig");
 const Unit = math.Unit;
 
 pub const Config = struct {
@@ -67,7 +67,7 @@ pub const System = struct {
                     v.* = Unit.sub3(v.*, Unit.scale3(g_norm, vn));
                 }
                 const spd = Unit.len3(.{ v[0], Unit.ZERO, v[2] });
-                if (spd.v > 102) { // > 0.1
+                if (spd.v > 102) {
                     const drop = spd.mul(cfg.friction.mul(dt));
                     const sf = Unit.raw(@max(0, spd.v - drop.v)).div(spd);
                     v[0] = v[0].mul(sf);
@@ -109,7 +109,6 @@ pub const System = struct {
                         rem = Unit.sub3(rem, Unit.scale3(dir, Unit.raw(@min(md.v, l.v))));
                     }
                     
-                    // Add 1/1024 padding
                     p.* = Unit.add3(p.*, Unit.scale3(h.normal, Unit.raw(1)));
                     rem = clip(rem, h.normal);
                     v.* = clip(v.*, h.normal);

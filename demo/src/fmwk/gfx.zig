@@ -3,7 +3,6 @@ const sdl = @import("sdl3");
 const gpu = sdl.gpu;
 const math = @import("math.zig");
 
-// Seamlessly maps [3]math.Unit layout to the GPU's .i32x3 integers
 pub const Vertex = extern struct {
     pos: [3]math.Unit,
     color: [4]f32,
@@ -20,9 +19,8 @@ pub const Renderer = struct {
 
     device: gpu.Device,
     window: sdl.video.Window,
-    pipeline: gpu.GraphicsPipeline,
-    ui_pipeline: gpu.GraphicsPipeline,
-    ui_handle: ?Handle = null,
+    pipe_3d: gpu.GraphicsPipeline,
+    pipe_2d: gpu.GraphicsPipeline,
     depth_tex: ?gpu.Texture = null,
     width: u32 = 0,
     height: u32 = 0,
@@ -107,19 +105,19 @@ pub const Renderer = struct {
             },
         };
 
-        const pipeline = try device.createGraphicsPipeline(pipe_info);
+        const pipe_3d = try device.createGraphicsPipeline(pipe_info);
 
         pipe_info.depth_stencil_state.enable_depth_test = false;
         pipe_info.depth_stencil_state.enable_depth_write = false;
         pipe_info.rasterizer_state.cull_mode = .none;
 
-        const ui_pipeline = try device.createGraphicsPipeline(pipe_info);
+        const pipe_2d = try device.createGraphicsPipeline(pipe_info);
 
         return .{
             .device = device,
             .window = window,
-            .pipeline = pipeline,
-            .ui_pipeline = ui_pipeline,
+            .pipe_3d = pipe_3d,
+            .pipe_2d = pipe_2d,
             .alloc = alloc,
         };
     }
@@ -138,8 +136,8 @@ pub const Renderer = struct {
             self.device.releaseTexture(t);
         }
 
-        self.device.releaseGraphicsPipeline(self.pipeline);
-        self.device.releaseGraphicsPipeline(self.ui_pipeline);
+        self.device.releaseGraphicsPipeline(self.pipe_3d);
+        self.device.releaseGraphicsPipeline(self.pipe_2d);
         self.device.releaseWindow(self.window);
         self.device.deinit();
     }
@@ -268,7 +266,7 @@ pub const Renderer = struct {
         };
     }
 
-    pub fn drawDirect(self: *Renderer, handle: Handle, mvp: [16]f32) void {
+    pub fn draw(self: *Renderer, handle: Handle, mvp: [16]f32, is_overlay: bool) void {
         if (handle >= self.meshes.items.len) return;
 
         const m = self.meshes.items[handle];
@@ -276,27 +274,11 @@ pub const Renderer = struct {
 
         const rp = self.render_pass orelse return;
 
-        rp.bindGraphicsPipeline(self.pipeline);
+        rp.bindGraphicsPipeline(if (is_overlay) self.pipe_2d else self.pipe_3d);
         rp.bindVertexBuffers(0, &.{.{ .buffer = m.vbo, .offset = 0 }});
         rp.bindIndexBuffer(.{ .buffer = m.ibo, .offset = 0 }, .indices_32bit);
 
         self.cmd.?.pushVertexUniformData(0, std.mem.asBytes(&mvp));
-        rp.drawIndexedPrimitives(m.idx_count, 1, 0, 0, 0);
-    }
-
-    pub fn drawUI(self: *Renderer, handle: Handle, ortho_mvp: [16]f32) void {
-        if (handle >= self.meshes.items.len) return;
-
-        const m = self.meshes.items[handle];
-        if (m.idx_count == 0) return;
-
-        const rp = self.render_pass orelse return;
-
-        rp.bindGraphicsPipeline(self.ui_pipeline);
-        rp.bindVertexBuffers(0, &.{.{ .buffer = m.vbo, .offset = 0 }});
-        rp.bindIndexBuffer(.{ .buffer = m.ibo, .offset = 0 }, .indices_32bit);
-
-        self.cmd.?.pushVertexUniformData(0, std.mem.asBytes(&ortho_mvp));
         rp.drawIndexedPrimitives(m.idx_count, 1, 0, 0, 0);
     }
 };
