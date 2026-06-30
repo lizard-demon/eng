@@ -14,7 +14,7 @@ const Tree = fmwk.bsp.tree.Tree;
 const Mesher = fmwk.bsp.mesher.Mesher;
 
 pub const App = struct {
-    const Ui = ui.UiState(gfx.Vertex);
+    const Ui = ui.State(gfx.Vertex);
     const LevelMesher = Mesher(gfx.Vertex);
 
     alloc: std.mem.Allocator,

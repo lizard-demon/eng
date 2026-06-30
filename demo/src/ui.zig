@@ -101,7 +101,7 @@ const font: [128][5]u8 = init: {
     break :init f;
 };
 
-pub fn UiState(comptime Vertex: type) type {
+pub fn State(comptime Vertex: type) type {
     return struct {
         const Self = @This();
 
