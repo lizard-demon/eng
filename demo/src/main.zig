@@ -5,6 +5,7 @@ const math = sdl.math;
 const Unit = math.Unit;
 const Vec3 = math.Vec3;
 const phys = @import("phys.zig");
+const weapons = @import("weapons.zig");
 const BVH = @import("bvh.zig").Tree;
 
 const FPS_BUCKETS: usize = 501;
@@ -50,8 +51,11 @@ pub const App = struct {
     render_indices: std.ArrayListUnmanaged(u32) = .{},
     mesh_h: sdl.Scene.Handle = 0,
     in: sdl.Input(Action),
-    physics: phys.System,
-    player_id: u32 = 0,
+    
+    // --- 100% POD Rollback State ---
+    state: phys.GameState = .{},
+    player_id: usize = 0,
+    
     last_time: u64 = 0,
     accumulator: f32 = 0.0,
 
@@ -77,17 +81,15 @@ pub const App = struct {
             .ui = undefined,
             .level_bvh = BVH.init(alloc),
             .in = sdl.Input(Action).init(),
-            .physics = phys.System.init(alloc),
             .last_time = sdl.c.SDL_GetTicksNS(),
         };
 
-        // --- Action Bindings & Input Setup ---
         app.in.sensitivity = 1.0; 
         app.in.bindKey(.jump, sdl.c.SDL_SCANCODE_SPACE);
         app.in.bindKey(.crouch, sdl.c.SDL_SCANCODE_LCTRL);
         app.in.bindMouse(.fire, sdl.c.SDL_BUTTON_LEFT);
-        app.in.bindWheel(.jump, false);  // Scroll down
-        app.in.bindWheel(.crouch, true); // Scroll up
+        app.in.bindWheel(.jump, false);
+        app.in.bindWheel(.crouch, true);
 
         const vert_spv = @embedFile("shaders/triangle.vert.spv");
         const frag_spv = @embedFile("shaders/triangle.frag.spv");
@@ -104,7 +106,6 @@ pub const App = struct {
     }
 
     pub fn deinit(self: *App) void {
-        self.physics.deinit();
         self.ui.deinit();
         self.scene.deinit();
         self.dev.deinit();
@@ -135,7 +136,11 @@ pub const App = struct {
     }
 
     fn spawn(self: *App) !void {
-        self.player_id = try self.physics.add(.{ 0, Unit.fix(1.5).v, 0 });
+        if (self.state.spawnPlayer(.{ 0, Unit.fix(1.5).v, 0 })) |id| {
+            self.player_id = id;
+        } else {
+            std.debug.print("Server full!\n", .{});
+        }
     }
 
     fn record(self: *App, fps: f32) void {
@@ -200,15 +205,20 @@ pub const App = struct {
         }
 
         if (self.in.mouse_locked) {
-            self.physics.angles.items[self.player_id] = self.physics.angles.items[self.player_id]
+            self.state.angles[self.player_id] = self.state.angles[self.player_id]
                 .addY(@intFromFloat(self.in.mouse_dx * 30.0))
                 .addX(@intFromFloat(self.in.mouse_dy * 30.0))
                 .clampPitch();
         }
+
+        if (self.in.keyPressed(sdl.c.SDL_SCANCODE_1)) self.state.weapon_states[self.player_id].id = .pistol;
+        if (self.in.keyPressed(sdl.c.SDL_SCANCODE_2)) self.state.weapon_states[self.player_id].id = .shotgun;
+        if (self.in.keyPressed(sdl.c.SDL_SCANCODE_3)) self.state.weapon_states[self.player_id].id = .rifle;
+        if (self.in.keyPressed(sdl.c.SDL_SCANCODE_4)) self.state.weapon_states[self.player_id].id = .rocket;
     }
 
     fn advance(self: *App) void {
-        // Only process player movement commands if the game window is locked
+        // Collect local inputs
         const in_jump = self.in.consume(.jump, false) and self.in.mouse_locked;
         const in_crouch = self.in.consume(.crouch, self.in.key(sdl.c.SDL_SCANCODE_LCTRL)) and self.in.mouse_locked;
         const in_fire = self.in.consume(.fire, false) and self.in.mouse_locked;
@@ -216,21 +226,23 @@ pub const App = struct {
         const w_val = if (self.in.key(sdl.c.SDL_SCANCODE_W) and self.in.mouse_locked) Unit.ONE else if (self.in.key(sdl.c.SDL_SCANCODE_S) and self.in.mouse_locked) Unit.ONE.neg() else Unit.ZERO;
         const d_val = if (self.in.key(sdl.c.SDL_SCANCODE_D) and self.in.mouse_locked) Unit.ONE else if (self.in.key(sdl.c.SDL_SCANCODE_A) and self.in.mouse_locked) Unit.ONE.neg() else Unit.ZERO;
 
-        const angles = self.physics.angles.items[self.player_id];
+        const angles = self.state.angles[self.player_id];
         const wish_dir = wishdir(angles, w_val, d_val);
 
-        const flags = self.physics.flags.items[self.player_id];
+        // Map inputs into the frame bucket. (In a networked game, other indices come from network buffers).
+        var inputs = [_]phys.InputState{.{}} ** phys.MAX_PLAYERS;
+        inputs[self.player_id] = .{
+            .wish = wish_dir,
+            .jump = in_jump,
+            .crouch = in_crouch,
+            .fire = in_fire,
+            .view_angle = angles,
+        };
+
         const cfg = phys.Config{};
         
-        const eye_h = if (flags.crouched) cfg.stand_eye.sub(cfg.crouch_offset) else cfg.stand_eye;
-        var eye_pos = self.physics.pos.items[self.player_id];
-        eye_pos[1] += eye_h.v;
-
-        self.physics.step(
-            &self.level_bvh,
-            &.{.{ .wish = wish_dir, .jump = in_jump, .crouch = in_crouch, .fire = in_fire, .view_fwd = angles.forward(), .eye_pos = eye_pos }},
-            Unit.fix(1.0 / 60.0), cfg,
-        );
+        // Advance unified state exactly 1 fixed tick
+        self.state.step(&self.level_bvh, &inputs, Unit.fix(1.0 / 60.0), cfg);
     }
 
     fn drawHud(self: *App, wf: f32, hf: f32) !void {
@@ -243,11 +255,12 @@ pub const App = struct {
             try self.ui.drawText(cx - 15.0 * 6.0, cy + 10.0, 2.0, "CLICK TO RESUME", .{ 1, 1, 1, 1 });
         }
 
-        const hp = self.physics.health.items[self.player_id];
-        const h_start = (wf / 2.0) - ((4.0 * 30.0 + 3.0 * 6.0) / 2.0);
-        for (0..4) |i| {
-            try self.ui.drawRect(h_start + @as(f32, @floatFromInt(i)) * 36.0, hf - 40.0, 30.0, 10.0, if (i < hp) [4]f32{ 0.1, 0.8, 0.3, 1.0 } else [4]f32{ 0.2, 0.2, 0.2, 0.5 });
-        }
+        const hp = @as(f32, @floatFromInt(self.state.health[self.player_id]));
+        const max_hp = 256.0;
+        const hp_pct = @max(0.0, hp / max_hp);
+        const w = 240.0;
+        try self.ui.drawRect(wf / 2.0 - w / 2.0, hf - 40.0, w, 15.0, .{ 0.2, 0.2, 0.2, 0.5 });
+        try self.ui.drawRect(wf / 2.0 - w / 2.0, hf - 40.0, w * hp_pct, 15.0, .{ 0.1, 0.8, 0.3, 1.0 });
 
         self.hud_frame_counter += 1;
         if (self.hud_frame_counter >= HUD_PERCENTILE_INTERVAL) {
@@ -261,13 +274,13 @@ pub const App = struct {
         try self.ui.drawText((wf / 2.0) - (@as(f32, @floatFromInt(fps_str.len)) * 12.0) - 10.0, 10.0, 2.0, fps_str, .{ 0.4, 1.0, 0.4, 1.0 });
 
         var hbuf: [128]u8 = undefined;
-        const pos = self.physics.pos.items[self.player_id];
-
-        const vx = Unit.raw(self.physics.vel.items[self.player_id][0]).flt();
-        const vz = Unit.raw(self.physics.vel.items[self.player_id][2]).flt();
+        const pos = self.state.pos[self.player_id];
+        const vx = Unit.raw(self.state.vel[self.player_id][0]).flt();
+        const vz = Unit.raw(self.state.vel[self.player_id][2]).flt();
         const speed = @sqrt(vx * vx + vz * vz);
-
-        const info_str = try std.fmt.bufPrint(&hbuf, "POS: {d:.1} {d:.1} {d:.1} - {d:.1}", .{ Unit.raw(pos[0]).flt(), Unit.raw(pos[1]).flt(), Unit.raw(pos[2]).flt(), speed });
+        
+        const wep = self.state.weapon_states[self.player_id].id;
+        const info_str = try std.fmt.bufPrint(&hbuf, "HP: {d} | POS: {d:.1} {d:.1} {d:.1} - {d:.1} | WEP: {s}", .{ @as(u32, @intFromFloat(hp)), Unit.raw(pos[0]).flt(), Unit.raw(pos[1]).flt(), Unit.raw(pos[2]).flt(), speed, @tagName(wep) });
         try self.ui.drawText(10, 10, 2.0, info_str, .{ 0.8, 0.8, 0.4, 1.0 });
     }
 
@@ -278,14 +291,14 @@ pub const App = struct {
 
             try self.drawHud(wf, hf);
 
-            const flags = self.physics.flags.items[self.player_id];
+            const flags = self.state.flags[self.player_id];
             const cfg = phys.Config{};
             
             const eye_h = if (flags.crouched) cfg.stand_eye.sub(cfg.crouch_offset) else cfg.stand_eye;
-            const v = cameraView(self.physics.angles.items[self.player_id], self.physics.pos.items[self.player_id], eye_h);
+            const v = cameraView(self.state.angles[self.player_id], self.state.pos[self.player_id], eye_h);
             const vp = math.mulMat(math.persp(90.0, wf / hf, 0.1, 500.0), v);
 
-            for (self.physics.rockets) |r| {
+            for (self.state.projectiles) |r| {
                 if (!r.active) continue;
                 const clip_w = vp[3] * Unit.raw(r.pos[0]).flt() + vp[7] * Unit.raw(r.pos[1]).flt() + vp[11] * Unit.raw(r.pos[2]).flt() + vp[15];
                 if (clip_w > 0.1) {
