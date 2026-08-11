@@ -1,17 +1,12 @@
 .{
-    .name = .engine,
-    .version = "0.0.1",
-    .fingerprint = 0xe8a81a8db6b97ad5,
-    .minimum_zig_version = "0.15.2",
-    .dependencies = .{
-        .sdl3 = .{
-            .url = "git+https://codeberg.org/7Games/zig-sdl3?ref=v0.1.9#45ffa097ad183a72f81d42f9f8c0df0398663814",
-            .hash = "sdl3-0.1.9-NmT1Q2k0JwAtPRns9E3OO6qpqpvy8mn80guJ8L209AtI",
-        },
-    },
+    .name = .kami, // <-- Remove the quotes and add a leading dot
+    .version = "0.1.0",
+    .minimum_zig_version = "0.13.0",
+    .fingerprint = 0x604bc21f3acaee63,
     .paths = .{
         "build.zig",
         "build.zig.zon",
         "src",
+        "demo",
     },
 }
