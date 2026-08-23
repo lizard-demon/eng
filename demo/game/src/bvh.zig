@@ -30,7 +30,6 @@ pub const Tree = struct {
     pub fn init(alloc: std.mem.Allocator) Tree { return .{ .alloc = alloc }; }
     pub fn deinit(s: *Tree) void { s.nodes.deinit(s.alloc); s.tris.deinit(s.alloc); s.tri_ids.deinit(s.alloc); }
 
-    // Use native Vec3 instead of [3]Unit
     pub fn addTri(s: *Tree, a: Vec3, b: Vec3, c: Vec3) !void {
         const n = math.norm(math.cross(b - a, c - a));
         try s.tris.append(s.alloc, .{ .a = a, .b = b, .c = c, .n = n });
@@ -93,7 +92,6 @@ pub const Tree = struct {
         return idx;
     }
 
-    // Trace using native vectors
     pub fn trace(s: *const Tree, start: Vec3, dir: Vec3, max_d: Unit) ?struct { normal: Vec3, dist: Unit } {
         if (s.nodes.items.len == 0) return null;
         
@@ -133,8 +131,6 @@ pub const Tree = struct {
             }
         }
         
-        // SIMPLIFICATION: Because we use backface culling, the normal is guaranteed
-        // to be facing the correct direction toward the ray origin. No flipping check needed.
         if (hit) {
             return .{ .normal = hit_n, .dist = t_min };
         }

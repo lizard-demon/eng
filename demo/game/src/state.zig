@@ -1,12 +1,12 @@
 const std = @import("std");
 const kami = @import("kami");
 const math = kami.math;
-const weapons = @import("weapons.zig");
 const Unit = math.Unit;
 const Vec3 = math.Vec3;
 
 pub const MAX_PLAYERS = 8;
 pub const MAX_PROJECTILES = 32;
+pub const MAX_IMPACTS = 64;
 
 pub const Config = struct {
     gravity: Unit = Unit.fix(9.8),
@@ -29,22 +29,117 @@ pub const Config = struct {
     max_slides: u32 = 4,
     radius: Unit = Unit.fix(0.3),
     ground_snap: Unit = Unit.fix(0.05),
+
+    spark_life: Unit = Unit.fix(1.5),
+    blood_life: Unit = Unit.fix(1.0),
+    explosion_life: Unit = Unit.fix(3.0),
 };
 
-pub const Flags = packed struct(u8) {
-    grounded: bool = false, crouched: bool = false, _pad: u6 = 0,
+pub const Weapon = struct {
+    pub const Type = enum { pistol, shotgun, rifle, rocket };
+
+    pub const Def = struct {
+        damage: u32,
+        cooldown: Unit,
+        auto: bool,
+        proj_speed: Unit = Unit.ZERO,
+        spray: []const [2]i32 = &.{},
+        pellets: []const [2]i32 = &.{.{ 0, 0 }},
+    };
+
+    fn comptimeSpread(comptime N: usize, comptime spread: f32) [N][2]i32 {
+        var res: [N][2]i32 = undefined;
+        if (N == 1) { res[0] = .{ 0, 0 }; return res; }
+        for (0..N) |i| {
+            const r = @sqrt(@as(f32, @floatFromInt(i)) / (N - 1)) * spread * 1024.0;
+            const t = @as(f32, @floatFromInt(i)) * 2.39996323; // Golden angle
+            res[i] = .{ @intFromFloat(r * @cos(t)), @intFromFloat(r * @sin(t)) };
+        }
+        return res;
+    }
+
+    pub const ak_pattern = [_][2]i32{ .{0,0}, .{0,-50}, .{-20,-100}, .{30,-140}, .{60,-160} };
+
+    pub const catalog = std.EnumArray(Type, Def).init(.{
+        .pistol  = .{ .damage = 15, .cooldown = Unit.fix(0.2), .auto = false },
+        .shotgun = .{ .damage = 8,  .cooldown = Unit.fix(0.8), .auto = false, .pellets = &comptimeSpread(9, 0.08) },
+        .rifle   = .{ .damage = 25, .cooldown = Unit.fix(0.1), .auto = true,  .spray = &ak_pattern },
+        .rocket  = .{ .damage = 80, .cooldown = Unit.fix(1.2), .auto = false, .proj_speed = Unit.fix(25.0) },
+    });
+
+    pub const Shot = struct { dir: Vec3, speed: Unit, damage: u32 };
+
+    pub const State = struct {
+        id: Type = .pistol,
+        cd: Unit = Unit.ZERO,
+        time: Unit = Unit.ZERO,
+        recovery: Unit = Unit.ZERO,
+        spray_idx: usize = 0,
+        was_firing: bool = false,
+
+        pub fn tick(self: *State, dt: Unit) void {
+            const def = catalog.get(self.id);
+            if (self.cd.v > 0) self.cd = self.cd.sub(dt);
+            self.time = self.time.add(dt);
+            
+            if (!self.was_firing and self.spray_idx > 0) {
+                self.recovery = self.recovery.add(dt);
+                if (self.recovery.v >= def.cooldown.v) {
+                    self.spray_idx -= 1;
+                    self.recovery = self.recovery.sub(def.cooldown);
+                }
+            } else {
+                self.recovery = Unit.ZERO;
+            }
+        }
+
+        pub fn fire(self: *State, base: math.Angle, want: bool, out: []Shot) usize {
+            const def = catalog.get(self.id);
+            const is_new_press = want and !self.was_firing;
+            self.was_firing = want;
+
+            const trigger_pulled = if (def.auto) want else is_new_press;
+            if (!trigger_pulled or self.cd.v > 0) return 0;
+            
+            self.cd = def.cooldown;
+            self.time = Unit.ZERO;
+
+            const recoil = if (def.spray.len > 0) def.spray[@min(self.spray_idx, def.spray.len - 1)] else .{ 0, 0 };
+            if (def.spray.len > 0 and self.spray_idx < def.spray.len - 1) self.spray_idx += 1;
+
+            for (def.pellets, 0..) |p, i| {
+                out[i] = .{
+                    .dir = base.addX(recoil[1] + p[1]).addY(recoil[0] + p[0]).clampPitch().forward(),
+                    .speed = def.proj_speed,
+                    .damage = def.damage,
+                };
+            }
+            return def.pellets.len;
+        }
+    };
 };
 
-pub const InputState = struct {
-    wish: Vec3 = .{ 0, 0, 0 }, 
-    view_angle: math.Angle = .{}, 
-    jump: bool = false, 
-    crouch: bool = false, 
-    fire: bool = false, 
+pub const Player = struct {
+    pub const Flags = packed struct(u8) { grounded: bool = false, crouched: bool = false, _pad: u6 = 0 };
+    pub const Input = struct {
+        wish: Vec3 = .{ 0, 0, 0 }, 
+        view_angle: math.Angle = .{}, 
+        jump: bool = false, 
+        crouch: bool = false, 
+        fire: bool = false, 
+    };
 };
 
 pub const Projectile = struct {
     active: bool = false, owner_id: usize = 0, pos: Vec3 = .{ 0, 0, 0 }, vel: Vec3 = .{ 0, 0, 0 }, damage: u32 = 0,
+};
+
+pub const Impact = struct {
+    pub const Kind = enum(u8) { spark, blood, explosion };
+    pos: Vec3 = .{ 0, 0, 0 },
+    normal: Vec3 = .{ 0, 1024, 0 },
+    life: Unit = Unit.ZERO,
+    kind: Kind = .spark,
 };
 
 fn raySphere(ro: Vec3, rd: Vec3, center: Vec3, radius: Unit, max_t: Unit) ?Unit {
@@ -60,7 +155,7 @@ fn raySphere(ro: Vec3, rd: Vec3, center: Vec3, radius: Unit, max_t: Unit) ?Unit 
     return null;
 }
 
-fn applyDamage(state: *GameState, id: usize, dir: Vec3, damage: u32, cfg: Config) void {
+fn applyDamage(state: *Game, id: usize, dir: Vec3, damage: u32, cfg: Config) void {
     if (damage == 0) return;
     state.health[id] -|= damage;
 
@@ -72,19 +167,17 @@ fn applyDamage(state: *GameState, id: usize, dir: Vec3, damage: u32, cfg: Config
     state.impulse[id] += math.scale(push_dir, kb_mag);
 }
 
-fn explode(state: *GameState, ex_p: Vec3, cfg: Config, damage: u32) void {
+fn explode(state: *Game, ex_p: Vec3, cfg: Config, damage: u32) void {
     for (0..MAX_PLAYERS) |id| {
         if (!state.isActive(id)) continue;
-        
         var center = state.pos[id];
         center[1] += Unit.fix(0.4).v;
         
         const push_vec = center - ex_p;
         const d = math.len(push_vec);
-        
         if (d.v < cfg.explosion_radius.v and d.v > 0) {
             const falloff = Unit.ONE.sub(d.div(cfg.explosion_radius));
-            const dmg_applied = @as(u32, @intFromFloat(@as(f32, @floatFromInt(damage)) * falloff.flt()));
+            const dmg_applied = @as(u32, @intCast((@as(u64, damage) * @as(u64, @intCast(@max(0, falloff.v)))) >> 10));
             applyDamage(state, id, math.norm(push_vec), dmg_applied, cfg);
         }
     }
@@ -97,7 +190,7 @@ fn ground(world: anytype, p: Vec3, cfg: Config) ?Vec3 {
     return null;
 }
 
-fn crouch(world: anytype, p: *Vec3, v: *Vec3, f: *Flags, want: bool, was_grounded: bool, cfg: Config) void {
+fn crouch(world: anytype, p: *Vec3, v: *Vec3, f: *Player.Flags, want: bool, was_grounded: bool, cfg: Config) void {
     if (want) {
         if (!f.crouched) {
             f.crouched = true;
@@ -164,22 +257,25 @@ fn slide(world: anytype, p: *Vec3, v: *Vec3, dt: Unit, cfg: Config) void {
     }
 }
 
-pub const GameState = struct {
+pub const Game = struct {
     active_mask: u8 = 0,
     pos: [MAX_PLAYERS]Vec3 = [_]Vec3{.{0,0,0}} ** MAX_PLAYERS,
     vel: [MAX_PLAYERS]Vec3 = [_]Vec3{.{0,0,0}} ** MAX_PLAYERS,
     impulse: [MAX_PLAYERS]Vec3 = [_]Vec3{.{0,0,0}} ** MAX_PLAYERS,
     angles: [MAX_PLAYERS]math.Angle = [_]math.Angle{.{}} ** MAX_PLAYERS,
-    flags: [MAX_PLAYERS]Flags = [_]Flags{.{}} ** MAX_PLAYERS,
+    flags: [MAX_PLAYERS]Player.Flags = [_]Player.Flags{.{}} ** MAX_PLAYERS,
     health: [MAX_PLAYERS]u32 = [_]u32{256} ** MAX_PLAYERS,
-    weapon_states: [MAX_PLAYERS]weapons.WeaponState = [_]weapons.WeaponState{.{}} ** MAX_PLAYERS,
+    weapon_states: [MAX_PLAYERS]Weapon.State = [_]Weapon.State{.{}} ** MAX_PLAYERS,
     projectiles: [MAX_PROJECTILES]Projectile = [_]Projectile{.{}} ** MAX_PROJECTILES,
+    
+    impacts: [MAX_IMPACTS]Impact = [_]Impact{.{}} ** MAX_IMPACTS,
+    impact_idx: usize = 0,
 
-    pub inline fn isActive(self: *const GameState, id: usize) bool {
+    pub inline fn isActive(self: *const Game, id: usize) bool {
         return (self.active_mask & (@as(u8, 1) << @intCast(id))) != 0;
     }
 
-    pub fn spawnPlayer(self: *GameState, p: Vec3) ?usize {
+    pub fn spawnPlayer(self: *Game, p: Vec3) ?usize {
         for (0..MAX_PLAYERS) |i| {
             if (!self.isActive(i)) {
                 self.active_mask |= @as(u8, 1) << @intCast(i);
@@ -196,12 +292,23 @@ pub const GameState = struct {
         return null;
     }
 
-    pub fn step(self: *GameState, world: anytype, inputs: []const InputState, dt: Unit, cfg: Config) void {
+    fn spawnImpact(self: *Game, p: Vec3, n: Vec3, kind: Impact.Kind, life: Unit) void {
+        self.impacts[self.impact_idx] = .{ .pos = p, .normal = n, .life = life, .kind = kind };
+        self.impact_idx = (self.impact_idx + 1) % MAX_IMPACTS;
+    }
+
+    pub fn step(self: *Game, world: anytype, inputs: []const Player.Input, dt: Unit, cfg: Config) void {
+        
+        for (&self.impacts) |*imp| {
+            if (imp.life.v > 0) {
+                imp.life = imp.life.sub(dt);
+                if (imp.life.v < 0) imp.life = Unit.ZERO;
+            }
+        }
+
         for (0..MAX_PLAYERS) |current_id| {
             if (!self.isActive(current_id)) continue;
             
-            // Pointer variables are 'const' because the pointers themselves aren't reassigned, 
-            // only the data they point to (e.g. p.*) is mutated.
             const p = &self.pos[current_id];
             const v = &self.vel[current_id];
             const imp = &self.impulse[current_id];
@@ -228,19 +335,23 @@ pub const GameState = struct {
             crouch(world, p, v, f, in.crouch, f.grounded, cfg);
             
             const eye_h = if (f.crouched) cfg.stand_eye.sub(cfg.crouch_offset) else cfg.stand_eye;
-            const eye_pos = .{ p.*[0], p.*[1] + eye_h.v, p.*[2] };
+            const eye_pos: Vec3 = .{ p.*[0], p.*[1] + eye_h.v, p.*[2] };
             
             wp.tick(dt);
-            var shots: [32]weapons.Shot = undefined;
-            const shot_count = weapons.fire(wp, in.view_angle, in.fire, &shots);
+            var shots: [32]Weapon.Shot = undefined;
+            const shot_count = wp.fire(in.view_angle, in.fire, &shots);
 
             for (shots[0..shot_count]) |shot| {
                 if (shot.speed.v == 0) {
                     var best_t = Unit.fix(500.0);
                     var hit_id: ?usize = null;
                     var is_head = false;
+                    var hit_n = Vec3{ 0, 1024, 0 };
                     
-                    if (world.trace(eye_pos, shot.dir, best_t)) |hit| best_t = hit.dist;
+                    if (world.trace(eye_pos, shot.dir, best_t)) |hit| {
+                        best_t = hit.dist;
+                        hit_n = hit.normal;
+                    }
                     
                     for (0..MAX_PLAYERS) |t_id| {
                         if (t_id == current_id or !self.isActive(t_id)) continue;
@@ -254,15 +365,20 @@ pub const GameState = struct {
                         
                         if (raySphere(eye_pos, shot.dir, head_pos, cfg.head_radius, best_t)) |t| {
                             best_t = t; hit_id = t_id; is_head = true;
+                            hit_n = math.norm(eye_pos + math.scale(shot.dir, t) - head_pos);
                         }
                         if (raySphere(eye_pos, shot.dir, body_pos, cfg.body_radius, best_t)) |t| {
                             best_t = t; hit_id = t_id; is_head = false;
+                            hit_n = math.norm(eye_pos + math.scale(shot.dir, t) - body_pos);
                         }
                     }
                     
+                    const hit_pos = eye_pos + math.scale(shot.dir, best_t);
                     if (hit_id) |id| {
-                        const dmg = if (is_head) shot.damage * 3 else shot.damage;
-                        applyDamage(self, id, shot.dir, dmg, cfg);
+                        applyDamage(self, id, shot.dir, if (is_head) shot.damage * 3 else shot.damage, cfg);
+                        self.spawnImpact(hit_pos, hit_n, .blood, cfg.blood_life);
+                    } else if (best_t.v < Unit.fix(500.0).v) {
+                        self.spawnImpact(hit_pos, hit_n, .spark, cfg.spark_life);
                     }
                 } else {
                     for (&self.projectiles) |*proj| {
@@ -319,7 +435,11 @@ pub const GameState = struct {
             
             if (exploded) {
                 r.active = false;
-                explode(self, r.pos + math.scale(dir, hit_t) + math.scale(hit_n, Unit.fix(0.1)), cfg, r.damage);
+                const exact_hit = r.pos + math.scale(dir, hit_t);
+                const ex_p = exact_hit + math.scale(hit_n, Unit.fix(0.1));
+                
+                self.spawnImpact(exact_hit, hit_n, .explosion, cfg.explosion_life);
+                explode(self, ex_p, cfg, r.damage);
             } else {
                 r.pos += math.scale(dir, dist);
             }

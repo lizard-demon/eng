@@ -16,7 +16,7 @@ pub fn build(b: *std.Build) void {
     const exe = b.addExecutable(.{
         .name = "demo",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("demo/src/main.zig"),
+            .root_source_file = b.path("demo/game/src/code.zig"),
             .target = target,
             .optimize = optimize,
         }),
@@ -30,9 +30,9 @@ pub fn build(b: *std.Build) void {
     const shaders = .{ "triangle.vert", "triangle.frag", "ui.vert", "ui.frag" };
     inline for (shaders) |shader| {
         const cmd = b.addSystemCommand(&.{"glslc"});
-        cmd.addArg(b.fmt("demo/src/shaders/{s}", .{shader})); // Removed .glsl
+        cmd.addArg(b.fmt("demo/game/src/shaders/{s}", .{shader})); // Removed .glsl
         cmd.addArg("-o");
-        cmd.addArg(b.fmt("demo/src/shaders/{s}.spv", .{shader}));
+        cmd.addArg(b.fmt("demo/game/src/shaders/{s}.spv", .{shader}));
         exe.step.dependOn(&cmd.step);
     }
 
