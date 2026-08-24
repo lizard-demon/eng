@@ -1,15 +1,16 @@
-// src/mod.zig — kami: a minimal single-file SDL3 GPU engine
+// src/mod.zig \u2014 kami: a minimal single-file SDL3 GPU engine
 pub const c = @cImport({
     @cInclude("SDL3/SDL.h");
 });
 const std = @import("std");
 
-inline fn cStruct(comptime T: type, fields: anytype) T {
+// UNIX-philosophy bridge: Seamlessly coerce strict Zig types to C-structs at compile time.
+inline fn c_obj(comptime T: type, fields: anytype) T {
     var res = std.mem.zeroes(T);
     inline for (@typeInfo(@TypeOf(fields)).@"struct".fields) |f| {
-        const DestT = @TypeOf(@field(res, f.name));
-        const ValT = @TypeOf(@field(fields, f.name));
-        if (comptime @typeInfo(DestT) == .int and (@typeInfo(ValT) == .int or @typeInfo(ValT) == .comptime_int)) {
+        const D = @TypeOf(@field(res, f.name));
+        const V = @TypeOf(@field(fields, f.name));
+        if (comptime @typeInfo(D) == .int and (@typeInfo(V) == .int or @typeInfo(V) == .comptime_int)) {
             @field(res, f.name) = @intCast(@field(fields, f.name));
         } else {
             @field(res, f.name) = @field(fields, f.name);
@@ -54,15 +55,17 @@ pub const Device = struct {
     pub fn beginFrame(self: *Device) !bool {
         self.cmd = c.SDL_AcquireGPUCommandBuffer(self.gpu) orelse return false;
         var uw: u32 = 0; var uh: u32 = 0;
+        
         if (!c.SDL_WaitAndAcquireGPUSwapchainTexture(self.cmd.?, self.window, &self.cur_sc_tex, &uw, &uh)) {
             _ = c.SDL_CancelGPUCommandBuffer(self.cmd.?);
-            self.cmd = null; return false;
+            self.cmd = null; 
+            return false;
         }
 
         if (self.depth_tex == null or self.width != uw or self.height != uh) {
             if (self.depth_tex) |d| c.SDL_ReleaseGPUTexture(self.gpu, d);
             self.width = uw; self.height = uh;
-            self.depth_tex = c.SDL_CreateGPUTexture(self.gpu, &cStruct(c.SDL_GPUTextureCreateInfo, .{
+            self.depth_tex = c.SDL_CreateGPUTexture(self.gpu, &c_obj(c.SDL_GPUTextureCreateInfo, .{
                 .type = c.SDL_GPU_TEXTURETYPE_2D, .format = c.SDL_GPU_TEXTUREFORMAT_D32_FLOAT,
                 .usage = c.SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET, .width = uw, .height = uh,
                 .layer_count_or_depth = 1, .num_levels = 1,
@@ -72,11 +75,11 @@ pub const Device = struct {
     }
 
     pub fn beginRenderPass(self: *Device, clear_color: [4]f32, use_depth: bool) void {
-        var color_tgt = cStruct(c.SDL_GPUColorTargetInfo, .{
+        var color_tgt = c_obj(c.SDL_GPUColorTargetInfo, .{
             .texture = self.cur_sc_tex, .load_op = c.SDL_GPU_LOADOP_CLEAR, .store_op = c.SDL_GPU_STOREOP_STORE,
             .clear_color = c.SDL_FColor{ .r = clear_color[0], .g = clear_color[1], .b = clear_color[2], .a = clear_color[3] },
         });
-        var depth_tgt = cStruct(c.SDL_GPUDepthStencilTargetInfo, .{
+        var depth_tgt = c_obj(c.SDL_GPUDepthStencilTargetInfo, .{
             .texture = self.depth_tex, .clear_depth = 1.0,
             .load_op = c.SDL_GPU_LOADOP_CLEAR, .store_op = c.SDL_GPU_STOREOP_DONT_CARE,
         });
@@ -90,29 +93,29 @@ pub const Device = struct {
     }
 
     pub fn createPipeline(self: *Device, cfg: PipelineCfg) !*c.SDL_GPUGraphicsPipeline {
-        const vs = c.SDL_CreateGPUShader(self.gpu, &cStruct(c.SDL_GPUShaderCreateInfo, .{ .code = cfg.vert_spv.ptr, .code_size = cfg.vert_spv.len, .entrypoint = "main", .format = c.SDL_GPU_SHADERFORMAT_SPIRV, .stage = c.SDL_GPU_SHADERSTAGE_VERTEX, .num_uniform_buffers = 1 })) orelse return error.ShaderFailed;
+        const vs = c.SDL_CreateGPUShader(self.gpu, &c_obj(c.SDL_GPUShaderCreateInfo, .{ .code = cfg.vert_spv.ptr, .code_size = cfg.vert_spv.len, .entrypoint = "main", .format = c.SDL_GPU_SHADERFORMAT_SPIRV, .stage = c.SDL_GPU_SHADERSTAGE_VERTEX, .num_uniform_buffers = 1 })) orelse return error.ShaderFailed;
         defer c.SDL_ReleaseGPUShader(self.gpu, vs);
-        const fs = c.SDL_CreateGPUShader(self.gpu, &cStruct(c.SDL_GPUShaderCreateInfo, .{ .code = cfg.frag_spv.ptr, .code_size = cfg.frag_spv.len, .entrypoint = "main", .format = c.SDL_GPU_SHADERFORMAT_SPIRV, .stage = c.SDL_GPU_SHADERSTAGE_FRAGMENT, .num_uniform_buffers = 0, .num_samplers = @as(u32, if (cfg.blend) 1 else 0) })) orelse return error.ShaderFailed;
+        const fs = c.SDL_CreateGPUShader(self.gpu, &c_obj(c.SDL_GPUShaderCreateInfo, .{ .code = cfg.frag_spv.ptr, .code_size = cfg.frag_spv.len, .entrypoint = "main", .format = c.SDL_GPU_SHADERFORMAT_SPIRV, .stage = c.SDL_GPU_SHADERSTAGE_FRAGMENT, .num_uniform_buffers = 0, .num_samplers = @as(u32, if (cfg.blend) 1 else 0) })) orelse return error.ShaderFailed;
         defer c.SDL_ReleaseGPUShader(self.gpu, fs);
 
         var v_desc = c.SDL_GPUVertexBufferDescription{ .slot = 0, .pitch = cfg.vertex_stride, .input_rate = c.SDL_GPU_VERTEXINPUTRATE_VERTEX, .instance_step_rate = 0 };
-        var pipe_info = cStruct(c.SDL_GPUGraphicsPipelineCreateInfo, .{
+        var pipe_info = c_obj(c.SDL_GPUGraphicsPipelineCreateInfo, .{
             .vertex_shader = vs, .fragment_shader = fs, .primitive_type = c.SDL_GPU_PRIMITIVETYPE_TRIANGLELIST,
-            .vertex_input_state = cStruct(c.SDL_GPUVertexInputState, .{ .vertex_buffer_descriptions = &v_desc, .num_vertex_buffers = 1, .vertex_attributes = cfg.attributes.ptr, .num_vertex_attributes = cfg.attributes.len }),
-            .rasterizer_state = cStruct(c.SDL_GPURasterizerState, .{ .cull_mode = if (cfg.depth_test) c.SDL_GPU_CULLMODE_BACK else c.SDL_GPU_CULLMODE_NONE, .front_face = c.SDL_GPU_FRONTFACE_COUNTER_CLOCKWISE, .fill_mode = c.SDL_GPU_FILLMODE_FILL }),
-            .depth_stencil_state = cStruct(c.SDL_GPUDepthStencilState, .{ .enable_depth_test = cfg.depth_test, .enable_depth_write = cfg.depth_test, .compare_op = c.SDL_GPU_COMPAREOP_LESS_OR_EQUAL }),
+            .vertex_input_state = c_obj(c.SDL_GPUVertexInputState, .{ .vertex_buffer_descriptions = &v_desc, .num_vertex_buffers = 1, .vertex_attributes = cfg.attributes.ptr, .num_vertex_attributes = cfg.attributes.len }),
+            .rasterizer_state = c_obj(c.SDL_GPURasterizerState, .{ .cull_mode = if (cfg.depth_test) c.SDL_GPU_CULLMODE_BACK else c.SDL_GPU_CULLMODE_NONE, .front_face = c.SDL_GPU_FRONTFACE_COUNTER_CLOCKWISE, .fill_mode = c.SDL_GPU_FILLMODE_FILL }),
+            .depth_stencil_state = c_obj(c.SDL_GPUDepthStencilState, .{ .enable_depth_test = cfg.depth_test, .enable_depth_write = cfg.depth_test, .compare_op = c.SDL_GPU_COMPAREOP_LESS_OR_EQUAL }),
         });
-        var target = cStruct(c.SDL_GPUColorTargetDescription, .{ .format = self.sc_format });
+        var target = c_obj(c.SDL_GPUColorTargetDescription, .{ .format = self.sc_format });
         if (cfg.blend) {
-            target.blend_state = cStruct(c.SDL_GPUColorTargetBlendState, .{ .enable_blend = true, .src_color_blendfactor = c.SDL_GPU_BLENDFACTOR_SRC_ALPHA, .dst_color_blendfactor = c.SDL_GPU_BLENDFACTOR_ONE_MINUS_SRC_ALPHA, .color_blend_op = c.SDL_GPU_BLENDOP_ADD, .src_alpha_blendfactor = c.SDL_GPU_BLENDFACTOR_ONE, .dst_alpha_blendfactor = c.SDL_GPU_BLENDFACTOR_ZERO, .alpha_blend_op = c.SDL_GPU_BLENDOP_ADD });
+            target.blend_state = c_obj(c.SDL_GPUColorTargetBlendState, .{ .enable_blend = true, .src_color_blendfactor = c.SDL_GPU_BLENDFACTOR_SRC_ALPHA, .dst_color_blendfactor = c.SDL_GPU_BLENDFACTOR_ONE_MINUS_SRC_ALPHA, .color_blend_op = c.SDL_GPU_BLENDOP_ADD, .src_alpha_blendfactor = c.SDL_GPU_BLENDFACTOR_ONE, .dst_alpha_blendfactor = c.SDL_GPU_BLENDFACTOR_ZERO, .alpha_blend_op = c.SDL_GPU_BLENDOP_ADD });
         }
-        pipe_info.target_info = cStruct(c.SDL_GPUGraphicsPipelineTargetInfo, .{ .color_target_descriptions = &target, .num_color_targets = 1, .has_depth_stencil_target = cfg.depth_test, .depth_stencil_format = c.SDL_GPU_TEXTUREFORMAT_D32_FLOAT });
+        pipe_info.target_info = c_obj(c.SDL_GPUGraphicsPipelineTargetInfo, .{ .color_target_descriptions = &target, .num_color_targets = 1, .has_depth_stencil_target = cfg.depth_test, .depth_stencil_format = c.SDL_GPU_TEXTUREFORMAT_D32_FLOAT });
         return c.SDL_CreateGPUGraphicsPipeline(self.gpu, &pipe_info) orelse error.PipelineFailed;
     }
 
     pub fn createTexture(self: *Device, width: u32, height: u32, format: c.SDL_GPUTextureFormat, pixels: []const u8) !*c.SDL_GPUTexture {
-        const tex = c.SDL_CreateGPUTexture(self.gpu, &cStruct(c.SDL_GPUTextureCreateInfo, .{ .type = c.SDL_GPU_TEXTURETYPE_2D, .format = format, .usage = c.SDL_GPU_TEXTUREUSAGE_SAMPLER, .width = width, .height = height, .layer_count_or_depth = 1, .num_levels = 1 })) orelse return error.TexFailed;
-        const tbuf = c.SDL_CreateGPUTransferBuffer(self.gpu, &cStruct(c.SDL_GPUTransferBufferCreateInfo, .{ .usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD, .size = pixels.len })) orelse return error.TransferFailed;
+        const tex = c.SDL_CreateGPUTexture(self.gpu, &c_obj(c.SDL_GPUTextureCreateInfo, .{ .type = c.SDL_GPU_TEXTURETYPE_2D, .format = format, .usage = c.SDL_GPU_TEXTUREUSAGE_SAMPLER, .width = width, .height = height, .layer_count_or_depth = 1, .num_levels = 1 })) orelse return error.TexFailed;
+        const tbuf = c.SDL_CreateGPUTransferBuffer(self.gpu, &c_obj(c.SDL_GPUTransferBufferCreateInfo, .{ .usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD, .size = pixels.len })) orelse return error.TransferFailed;
         defer c.SDL_ReleaseGPUTransferBuffer(self.gpu, tbuf);
 
         const ptr = c.SDL_MapGPUTransferBuffer(self.gpu, tbuf, false) orelse return error.MapFailed;
@@ -121,8 +124,8 @@ pub const Device = struct {
 
         const cmd = c.SDL_AcquireGPUCommandBuffer(self.gpu) orelse return error.CmdFailed;
         const copy_pass = c.SDL_BeginGPUCopyPass(cmd) orelse return error.CopyPassFailed;
-        var loc = cStruct(c.SDL_GPUTextureTransferInfo, .{ .transfer_buffer = tbuf });
-        var reg = cStruct(c.SDL_GPUTextureRegion, .{ .texture = tex, .w = width, .h = height, .d = 1 });
+        var loc = c_obj(c.SDL_GPUTextureTransferInfo, .{ .transfer_buffer = tbuf });
+        var reg = c_obj(c.SDL_GPUTextureRegion, .{ .texture = tex, .w = width, .h = height, .d = 1 });
 
         c.SDL_UploadToGPUTexture(copy_pass, &loc, &reg, false);
         c.SDL_EndGPUCopyPass(copy_pass);
@@ -131,7 +134,7 @@ pub const Device = struct {
     }
 
     pub fn createSampler(self: *Device, min_f: c.SDL_GPUFilter, mag_f: c.SDL_GPUFilter, mip_m: c.SDL_GPUSamplerMipmapMode) !*c.SDL_GPUSampler {
-        return c.SDL_CreateGPUSampler(self.gpu, &cStruct(c.SDL_GPUSamplerCreateInfo, .{ .min_filter = min_f, .mag_filter = mag_f, .mipmap_mode = mip_m, .address_mode_u = c.SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE, .address_mode_v = c.SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE })) orelse error.SamplerFailed;
+        return c.SDL_CreateGPUSampler(self.gpu, &c_obj(c.SDL_GPUSamplerCreateInfo, .{ .min_filter = min_f, .mag_filter = mag_f, .mipmap_mode = mip_m, .address_mode_u = c.SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE, .address_mode_v = c.SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE })) orelse error.SamplerFailed;
     }
 };
 
@@ -143,8 +146,8 @@ fn uploadBytes(dev: *Device, transfer: *c.SDL_GPUTransferBuffer, pass: *c.SDL_GP
     @memcpy(@as([*]u8, @ptrCast(p))[0..bytes.len], bytes);
     c.SDL_UnmapGPUTransferBuffer(dev.gpu, transfer);
 
-    var loc = cStruct(c.SDL_GPUTransferBufferLocation, .{ .transfer_buffer = transfer });
-    var reg = cStruct(c.SDL_GPUBufferRegion, .{ .buffer = dst, .size = bytes.len });
+    var loc = c_obj(c.SDL_GPUTransferBufferLocation, .{ .transfer_buffer = transfer });
+    var reg = c_obj(c.SDL_GPUBufferRegion, .{ .buffer = dst, .size = bytes.len });
     c.SDL_UploadToGPUBuffer(pass, &loc, &reg, cycle);
 }
 
@@ -164,8 +167,8 @@ pub const Buffer = struct {
     size: u32,
 
     pub fn create(dev: *Device, data: []const u8, usage: c.SDL_GPUBufferUsageFlags) !Buffer {
-        const handle = c.SDL_CreateGPUBuffer(dev.gpu, &cStruct(c.SDL_GPUBufferCreateInfo, .{ .usage = usage, .size = data.len })) orelse return error.BufferFailed;
-        const tbuf = c.SDL_CreateGPUTransferBuffer(dev.gpu, &cStruct(c.SDL_GPUTransferBufferCreateInfo, .{ .usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD, .size = data.len })) orelse return error.TransferFailed;
+        const handle = c.SDL_CreateGPUBuffer(dev.gpu, &c_obj(c.SDL_GPUBufferCreateInfo, .{ .usage = usage, .size = data.len })) orelse return error.BufferFailed;
+        const tbuf = c.SDL_CreateGPUTransferBuffer(dev.gpu, &c_obj(c.SDL_GPUTransferBufferCreateInfo, .{ .usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD, .size = data.len })) orelse return error.TransferFailed;
 
         const cmd = c.SDL_AcquireGPUCommandBuffer(dev.gpu) orelse return error.CmdFailed;
         const copy_pass = c.SDL_BeginGPUCopyPass(cmd) orelse return error.CopyFailed;
@@ -186,22 +189,26 @@ pub const Stream = struct {
     usage: c.SDL_GPUBufferUsageFlags,
 
     pub fn init(usage: c.SDL_GPUBufferUsageFlags) Stream { return .{ .usage = usage }; }
+    
     pub fn deinit(self: *Stream, dev: *Device) void {
         if (self.handle) |h| c.SDL_ReleaseGPUBuffer(dev.gpu, h);
         if (self.transfer) |t| c.SDL_ReleaseGPUTransferBuffer(dev.gpu, t);
         self.handle = null; self.transfer = null; self.cap = 0;
     }
+    
     fn ensure(self: *Stream, dev: *Device, needed: usize) !void {
         if (self.handle != null and needed <= self.cap) return;
-        const new_cap = ((needed + needed / 2) + 4095) / 4096 * 4096;
+        
+        // Classic Carmack bitwise alignment trick. Round up to nearest 4096 bytes.
+        const new_cap = ((needed + needed / 2) + 4095) & ~@as(usize, 4095);
 
-        const nh = c.SDL_CreateGPUBuffer(dev.gpu, &cStruct(c.SDL_GPUBufferCreateInfo, .{ .usage = self.usage, .size = new_cap })) orelse return error.BufferFailed;
-        const nt = c.SDL_CreateGPUTransferBuffer(dev.gpu, &cStruct(c.SDL_GPUTransferBufferCreateInfo, .{ .usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD, .size = new_cap })) orelse { c.SDL_ReleaseGPUBuffer(dev.gpu, nh); return error.TransferFailed; };
+        const nh = c.SDL_CreateGPUBuffer(dev.gpu, &c_obj(c.SDL_GPUBufferCreateInfo, .{ .usage = self.usage, .size = new_cap })) orelse return error.BufferFailed;
+        const nt = c.SDL_CreateGPUTransferBuffer(dev.gpu, &c_obj(c.SDL_GPUTransferBufferCreateInfo, .{ .usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD, .size = new_cap })) orelse { c.SDL_ReleaseGPUBuffer(dev.gpu, nh); return error.TransferFailed; };
 
-        if (self.handle) |h| c.SDL_ReleaseGPUBuffer(dev.gpu, h);
-        if (self.transfer) |t| c.SDL_ReleaseGPUTransferBuffer(dev.gpu, t);
+        self.deinit(dev);
         self.handle = nh; self.transfer = nt; self.cap = new_cap;
     }
+    
     pub fn upload(self: *Stream, dev: *Device, copy_pass: *c.SDL_GPUCopyPass, bytes: []const u8) !void {
         if (bytes.len == 0) return;
         try self.ensure(dev, bytes.len);
@@ -220,17 +227,15 @@ pub fn Input(comptime Action: type) type {
         keys_pressed: std.StaticBitSet(512) = std.StaticBitSet(512).initEmpty(),
         keys_released: std.StaticBitSet(512) = std.StaticBitSet(512).initEmpty(),
         
-        // Upgraded to f32 to retain SDL3 sub-pixel precision
         mouse_x: f32 = 0, mouse_y: f32 = 0, 
         mouse_dx: f32 = 0, mouse_dy: f32 = 0, 
         scroll_x: f32 = 0, scroll_y: f32 = 0,
         
-        mouse_held: [5]bool = [_]bool{false} ** 5, mouse_pressed: [5]bool = [_]bool{false} ** 5, mouse_released: [5]bool = [_]bool{false} ** 5,
+        mouse_held: [5]bool = .{false} ** 5, mouse_pressed: [5]bool = .{false} ** 5, mouse_released: [5]bool = .{false} ** 5,
         mouse_locked: bool = false, quit: bool = false,
-
         sensitivity: f32 = 1.0,
 
-        // --- Action LUTs & Buffers ---
+        // Action Mapping Data
         key_lut: [512]?Action = .{null} ** 512,
         mouse_lut: [5]?Action = .{null} ** 5,
         wheel_lut: [2]?Action = .{null} ** 2, // 0 = Up, 1 = Down
@@ -240,14 +245,11 @@ pub fn Input(comptime Action: type) type {
         prev: Mask = 0,
 
         pub fn init() @This() { return .{}; }
-        
         pub fn bindKey(self: *@This(), a: Action, sc: c.SDL_Scancode) void { self.key_lut[@intCast(sc)] = a; }
         pub fn bindMouse(self: *@This(), a: Action, btn: u8) void { self.mouse_lut[button(btn)] = a; }
         pub fn bindWheel(self: *@This(), a: Action, up: bool) void { self.wheel_lut[if (up) 0 else 1] = a; }
 
-        inline fn trigger(self: *@This(), a: Action) void {
-            self.pending |= (@as(Mask, 1) << @intFromEnum(a));
-        }
+        inline fn trigger(self: *@This(), a: Action) void { self.pending |= (@as(Mask, 1) << @intFromEnum(a)); }
 
         pub inline fn tick(self: *@This()) void {
             self.prev = self.current;
@@ -275,9 +277,7 @@ pub fn Input(comptime Action: type) type {
             const mstate = c.SDL_GetMouseState(&mx, &my);
             self.mouse_held = .{ (mstate & c.SDL_BUTTON_LMASK) != 0, (mstate & c.SDL_BUTTON_MMASK) != 0, (mstate & c.SDL_BUTTON_RMASK) != 0, (mstate & c.SDL_BUTTON_X1MASK) != 0, (mstate & c.SDL_BUTTON_X2MASK) != 0 };
             
-            // Retain raw float pixel coords
-            self.mouse_x = mx; 
-            self.mouse_y = my;
+            self.mouse_x = mx; self.mouse_y = my;
 
             var ev: c.SDL_Event = undefined;
             while (c.SDL_PollEvent(&ev)) {
@@ -306,13 +306,11 @@ pub fn Input(comptime Action: type) type {
                         if (idx < 5) self.mouse_released[idx] = true; 
                     },
                     c.SDL_EVENT_MOUSE_MOTION => if (self.mouse_locked) { 
-                        // Absorb high-precision float deltas scaled by user sensitivity
                         self.mouse_dx += ev.motion.xrel * self.sensitivity; 
                         self.mouse_dy += ev.motion.yrel * self.sensitivity; 
                     },
                     c.SDL_EVENT_MOUSE_WHEEL => { 
-                        self.scroll_x += ev.wheel.x; 
-                        self.scroll_y += ev.wheel.y;
+                        self.scroll_x += ev.wheel.x; self.scroll_y += ev.wheel.y;
                         if (ev.wheel.y > 0) { if (self.wheel_lut[0]) |a| self.trigger(a); }
                         else if (ev.wheel.y < 0) { if (self.wheel_lut[1]) |a| self.trigger(a); }
                     },
@@ -449,13 +447,14 @@ const font = struct {
                 const row = f[ch][y];
                 for (0..5) |x| {
                     const idx = (y * 640 + ch * 5 + x) * 4;
-                    px[idx] = 255; px[idx+1] = 255; px[idx+2] = 255;
-                    px[idx+3] = if (((row >> @intCast(4 - x)) & 1) == 1) 255 else 0;
+                    // Direct pointer intrinsic - brutal and fast memory initialization
+                    @as(*[4]u8, @ptrCast(&px[idx])).* = .{ 255, 255, 255, if (((row >> @intCast(4 - x)) & 1) == 1) 255 else 0 };
                 }
             }
         }
         break :init px;
     };
+    
     const char_uv: [128][2]f32 = init: {
         var t: [128][2]f32 = undefined;
         for (0..128) |ch| { const base: f32 = @floatFromInt(ch * 5); t[ch] = .{ base / 640.0, (base + 5.0) / 640.0 }; }
@@ -550,6 +549,7 @@ pub const Ui = struct {
 
         const v_bind = [_]c.SDL_GPUBufferBinding{.{ .buffer = self.vbo.handle.?, .offset = 0 }};
         c.SDL_BindGPUVertexBuffers(rp, 0, &v_bind, 1);
+        
         const i_bind = c.SDL_GPUBufferBinding{ .buffer = self.ibo.handle.?, .offset = 0 };
         c.SDL_BindGPUIndexBuffer(rp, &i_bind, c.SDL_GPU_INDEXELEMENTSIZE_32BIT);
 
@@ -564,29 +564,30 @@ pub const Ui = struct {
 };
 
 // ============================================================================
-// 4. MATH
+// 4. MATH: Fixed-point primitives and fast integer abstractions 
 // ============================================================================
 pub const math = struct {
-    // --- GENERIC EPSILON FOR INTEGER ROUNDING ERRORS ---
-    // Increased from 16 to fully prevent clipping through walls at grazing angles
     pub const EPSILON: i64 = 64; 
 
     pub const Vec3 = @Vector(3, i32);
 
     pub const Unit = extern struct {
         v: i32 = 0,
+        
         pub const ZERO = Unit{ .v = 0 };
         pub const ONE = Unit{ .v = 1024 };
+        
         pub inline fn fix(f: f32) Unit { return .{ .v = @intFromFloat(f * 1024.0) }; }
         pub inline fn raw(i: i32) Unit { return .{ .v = i }; }
-
         pub inline fn flt(self: Unit) f32 { return @as(f32, @floatFromInt(self.v)) * 0.0009765625; }
+        
         pub inline fn add(self: Unit, b: Unit) Unit { return .{ .v = self.v + b.v }; }
         pub inline fn sub(self: Unit, b: Unit) Unit { return .{ .v = self.v - b.v }; }
         pub inline fn mul(self: Unit, b: Unit) Unit { return .{ .v = @intCast((@as(i64, self.v) * b.v) >> 10) }; }
         pub inline fn div(self: Unit, b: Unit) Unit { return .{ .v = @intCast(@divTrunc(@as(i64, self.v) << 10, b.v)) }; }
         pub inline fn neg(self: Unit) Unit { return .{ .v = -self.v }; }
         pub inline fn abs(self: Unit) Unit { return .{ .v = if (self.v < 0) -self.v else self.v }; }
+        
         pub inline fn pow(self: Unit, exp: i32) Unit {
             if (exp == 0) return ONE;
             if (exp < 0) return ONE.div(self.pow(-exp));
@@ -601,25 +602,21 @@ pub const math = struct {
             return res;
         }
         pub inline fn fastFrac(num: i32, den: i32) Unit {
-            if (den == 0) return ZERO;
-            return raw(@intCast(@divTrunc(@as(i64, num) << 10, den)));
+            return if (den == 0) ZERO else raw(@intCast(@divTrunc(@as(i64, num) << 10, den)));
         }
     };
 
     pub inline fn scale(a: Vec3, s: Unit) Vec3 {
         const prod = @as(@Vector(3, i64), a) * @as(@Vector(3, i64), @splat(s.v));
-        // FIX: Add 512 for round-to-nearest to eliminate negative-axis drift
         return @truncate((prod + @as(@Vector(3, i64), @splat(512))) >> @as(@Vector(3, u6), @splat(10)));
     }
     
     pub inline fn dot(a: Vec3, b: Vec3) Unit {
         const prod = @reduce(.Add, @as(@Vector(3, i64), a) * @as(@Vector(3, i64), b));
-        // FIX: Add 512 for round-to-nearest
         return Unit.raw(@intCast((prod + 512) >> 10));
     }
     
     pub inline fn cross(a: Vec3, b: Vec3) Vec3 {
-        // FIX: Add 512 for round-to-nearest
         return .{
             @intCast(((@as(i64, a[1]) * b[2] - @as(i64, a[2]) * b[1]) + 512) >> 10),
             @intCast(((@as(i64, a[2]) * b[0] - @as(i64, a[0]) * b[2]) + 512) >> 10),
@@ -633,64 +630,44 @@ pub const math = struct {
         const b64: @Vector(3, i64) = b;
         return @truncate(a64 + (((b64 - a64) * @as(@Vector(3, i64), @splat(num))) / @as(@Vector(3, i64), @splat(den))));
     }
+
+    // Pre-computed Inverse Square Root mantissas
     const inv_sq_lut: [256]u16 = init: {
         @setEvalBranchQuota(10_000);
         var arr: [256]u16 = undefined;
-        for (256..512) |i| {
-            const val = @as(f64, @floatFromInt(i));
-            arr[i - 256] = @intFromFloat(@round((1.0 / std.math.sqrt(val)) * 32768.0));
-        }
+        for (256..512) |i| arr[i - 256] = @intFromFloat(@round((1.0 / std.math.sqrt(@as(f64, @floatFromInt(i)))) * 32768.0));
         break :init arr;
     };
 
-    /// Pre-computes the inverse ray direction for branchless AABB slab tests.
-    /// Safely handles division by zero using maxInt to simulate infinity.
     pub inline fn invRay(rd: Vec3) Vec3 {
         var inv: Vec3 = undefined;
         inline for (0..3) |i| inv[i] = if (rd[i] == 0) std.math.maxInt(i32) else @intCast(@divTrunc(@as(i64, 1) << 30, rd[i]));
         return inv;
     }
 
-    /// Fast Branchless AABB Slab Test. All internal math is 64-bit to prevent overflow.
     pub inline fn rayAABB(ro: Vec3, inv_rd: Vec3, min_box: Vec3, max_box: Vec3, max_t: Unit) bool {
-        const ro64 = @as(@Vector(3, i64), ro);
-        const inv64 = @as(@Vector(3, i64), inv_rd);
-        
-        // FIX: Pad the AABB by the generic EPSILON to absorb integer division 
-        // truncation error and prevent interval inversion on perfectly flat planes.
         const pad = @as(@Vector(3, i64), @splat(EPSILON));
         const min64 = @as(@Vector(3, i64), min_box) - pad;
         const max64 = @as(@Vector(3, i64), max_box) + pad;
-
-        const t0 = (min64 - ro64) * inv64;
-        const t1 = (max64 - ro64) * inv64;
+        const t0 = (min64 - @as(@Vector(3, i64), ro)) * @as(@Vector(3, i64), inv_rd);
+        const t1 = (max64 - @as(@Vector(3, i64), ro)) * @as(@Vector(3, i64), inv_rd);
 
         const t_near = @reduce(.Max, @min(t0, t1));
         const t_far  = @reduce(.Min, @max(t0, t1));
-
-        // Right shift by 20 to convert the (1<<30) scaled inverse back to Q22.10
         return t_near <= t_far and (t_near >> 20) < max_t.v;
     }
     
-    /// Exact integer Möller-Trumbore intersection. Uses 64-bit unscaled volume determinants.
     pub inline fn rayTri(ro: Vec3, rd: Vec3, v0: Vec3, v1: Vec3, v2: Vec3) ?Unit {
         const ro64 = @as(@Vector(3, i64), ro);
         const rd64 = @as(@Vector(3, i64), rd);
         const ta = @as(@Vector(3, i64), v0);
-        const tb = @as(@Vector(3, i64), v1);
-        const tc = @as(@Vector(3, i64), v2);
-
-        const e1 = tb - ta;
-        const e2 = tc - ta;
-
+        
+        const e1 = @as(@Vector(3, i64), v1) - ta;
+        const e2 = @as(@Vector(3, i64), v2) - ta;
         const h = @Vector(3, i64){ rd64[1]*e2[2] - rd64[2]*e2[1], rd64[2]*e2[0] - rd64[0]*e2[2], rd64[0]*e2[1] - rd64[1]*e2[0] };
         const det = @reduce(.Add, e1 * h);
         
-        // Backface culling eliminates the need for negative det branches
         if (det <= 0) return null; 
-
-        // Expand the barycentric bounds check by EPSILON scaled appropriately 
-        // for the cubic determinant size, closing microscopic edge seams perfectly.
         const edge_eps = EPSILON * 8192; 
 
         const sv = ro64 - ta;
@@ -702,21 +679,21 @@ pub const math = struct {
         if (v_val < -edge_eps or u + v_val > det + edge_eps) return null;
 
         const t_unscaled = @reduce(.Add, e2 * q);
-
-        // Safe i128 casting to prevent overflow on very large level geometry
         const t: i64 = @intCast(@divTrunc(@as(i128, t_unscaled) << 10, @as(i128, det)));
-        if (t > 0) return Unit.raw(@intCast(t));
-        return null;
+        return if (t > 0) Unit.raw(@intCast(t)) else null;
     }
     
     pub inline fn lenSq(a: Vec3) i64 {
         const a64: @Vector(3, i64) = a;
         return @reduce(.Add, a64 * a64);
     }
+    
     pub inline fn len(a: Vec3) Unit {
         const d = lenSq(a);
         return if (d <= 0) Unit.ZERO else Unit.raw(@intCast(std.math.sqrt(@as(u64, @intCast(d)))));
     }
+    
+    // Quake-style integer fast inverse square root using clz + mantissa LUT
     pub inline fn norm(a: Vec3) Vec3 {
         const d = @as(u64, @intCast(@max(0, lenSq(a))));
         if (d == 0) return .{ 0, 0, 0 };
@@ -724,6 +701,7 @@ pub const math = struct {
         const is_odd = b & 1;
         const shift = @as(i32, b) - 8;
         const mantissa: usize = @intCast(if (shift >= 0) d >> @intCast(shift) else d << @intCast(-shift));
+        
         var inv_len: u32 = inv_sq_lut[mantissa - 256];
         if (is_odd == 1) inv_len = @intCast((@as(u64, inv_len) * 46340) >> 16);
 
@@ -742,6 +720,7 @@ pub const math = struct {
         }
         return r;
     }
+    
     pub inline fn persp(fov: f32, asp: f32, near: f32, far: f32) [16]f32 {
         const t = std.math.tan(fov * std.math.pi / 360.0) * near;
         const r = t * asp;
@@ -752,6 +731,7 @@ pub const math = struct {
             0, 0, -(2 * far * near) / (far - near), 0,
         };
     }
+    
     pub inline fn ortho(l: f32, r: f32, b: f32, t: f32, n: f32, f: f32) [16]f32 {
         return .{
             2.0 / (r - l), 0, 0, 0,
@@ -761,61 +741,49 @@ pub const math = struct {
         };
     }
 
-    /// A yaw/pitch orientation stored as two u16 angle units, wrapping automatically.
+    // Binary Angle Measurement (BAMs) with fixed sine/cosine LUTs (14-bit quadrants)
     pub const Angle = packed struct(u64) {
-        x: u16 = 0,
-        y: u16 = 0,
-        scale_pad: u32 = 0,
+        x: u16 = 0, y: u16 = 0, scale_pad: u32 = 0,
+        
         const lut: [16385]i16 = init: {
             @setEvalBranchQuota(1_000_000);
             var arr: [16385]i16 = undefined;
-            for (0..16385) |i| {
-                const rad = @as(f64, @floatFromInt(i)) * (std.math.pi / 32768.0);
-                arr[i] = @intFromFloat(@round(std.math.sin(rad) * 1024.0));
-            }
+            for (0..16385) |i| arr[i] = @intFromFloat(@round(std.math.sin(@as(f64, @floatFromInt(i)) * (std.math.pi / 32768.0)) * 1024.0));
             break :init arr;
         };
+        
         pub inline fn sin(val: u16) Unit {
-            const quad: u2 = @truncate(val >> 14);
             const rem = val & 0x3FFF;
-            return Unit.raw(switch (quad) {
-                0 => lut[rem],
-                1 => lut[16384 - rem],
-                2 => -lut[rem],
-                3 => -lut[16384 - rem],
+            return Unit.raw(switch (@as(u2, @truncate(val >> 14))) {
+                0 => lut[rem], 1 => lut[16384 - rem], 2 => -lut[rem], 3 => -lut[16384 - rem],
             });
         }
+        
         pub inline fn cos(val: u16) Unit {
-            const quad: u2 = @truncate(val >> 14);
             const rem = val & 0x3FFF;
-            return Unit.raw(switch (quad) {
-                0 => lut[16384 - rem],
-                1 => -lut[rem],
-                2 => -lut[16384 - rem],
-                3 => lut[rem],
+            return Unit.raw(switch (@as(u2, @truncate(val >> 14))) {
+                0 => lut[16384 - rem], 1 => -lut[rem], 2 => -lut[16384 - rem], 3 => lut[rem],
             });
         }
+        
         pub inline fn addX(self: Angle, offset: i32) Angle {
-            var n = self;
-            n.x +%= @as(u16, @truncate(@as(u32, @bitCast(offset))));
-            return n;
+            var n = self; n.x +%= @as(u16, @truncate(@as(u32, @bitCast(offset)))); return n;
         }
+        
         pub inline fn addY(self: Angle, offset: i32) Angle {
-            var n = self;
-            n.y +%= @as(u16, @truncate(@as(u32, @bitCast(offset))));
-            return n;
+            var n = self; n.y +%= @as(u16, @truncate(@as(u32, @bitCast(offset)))); return n;
         }
+        
         pub inline fn clampPitch(self: Angle) Angle {
             var n = self;
             if (n.x > 16384 and n.x < 32768) n.x = 16384;
             if (n.x < 49152 and n.x >= 32768) n.x = 49152;
             return n;
         }
+        
         pub fn forward(self: Angle) Vec3 {
-            const cp = cos(self.x);
-            const sp = sin(self.x);
-            const cy = cos(self.y);
-            const sy = sin(self.y);
+            const cp = cos(self.x); const sp = sin(self.x);
+            const cy = cos(self.y); const sy = sin(self.y);
             return .{ cp.mul(sy).v, sp.neg().v, cp.mul(cy).neg().v };
         }
     };
