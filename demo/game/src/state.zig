@@ -144,16 +144,13 @@ pub const Impact = struct {
 };
 
 fn isBackstab(atk_angle: math.Angle, vic_angle: math.Angle, atk_pos: Vec3, vic_pos: Vec3) bool {
-    var flat_a = math.Angle{}; flat_a.y = atk_angle.y;
-    var flat_t = math.Angle{}; flat_t.y = vic_angle.y;
+    const fwd_a = atk_angle.forward();
+    const fwd_t = vic_angle.forward();
     
-    const fwd_a = flat_a.forward();
-    const fwd_t = flat_t.forward();
-    
-    const to_target = math.norm(.{ vic_pos[0] - atk_pos[0], 0, vic_pos[2] - atk_pos[2] });
+    const to_target = math.norm(vic_pos - atk_pos);
 
-    const facing_back = math.dot(fwd_a, fwd_t).v > 0; 
-    const positioned_behind = math.dot(to_target, fwd_t).v > 0;
+    const facing_back = math.dot(fwd_a, fwd_t).v > -200; 
+    const positioned_behind = math.dot(to_target, fwd_t).v > -200;
 
     return facing_back and positioned_behind;
 }
@@ -161,11 +158,14 @@ fn isBackstab(atk_angle: math.Angle, vic_angle: math.Angle, atk_pos: Vec3, vic_p
 fn raySphere(ro: Vec3, rd: Vec3, center: Vec3, radius: Unit, max_t: Unit) ?Unit {
     const to_center = center - ro;
     const t = math.dot(to_center, rd);
-    if (t.v < 0 or t.v > max_t.v) return null;
+    
+    if (t.v < 0) return null; // Sphere is behind the ray
     
     const closest = ro + math.scale(rd, t);
     if (math.len(closest - center).v <= radius.v) {
         const hit_t = t.sub(radius);
+        if (hit_t.v > max_t.v) return null; 
+        
         return if (hit_t.v < 0) Unit.ZERO else hit_t;
     }
     return null;
@@ -542,28 +542,26 @@ pub const Game = struct {
             }
         }
 
-        // Post-Movement Player-to-Player Cylinder Rejection
+        // Post-Movement Player-to-Player Spherical Rejection
         for (0..MAX_PLAYERS) |i| {
             if (!self.isActive(i)) continue;
             for (i + 1..MAX_PLAYERS) |j| {
                 if (!self.isActive(j)) continue;
                 
-                var diff = self.core.pos[i] - self.core.pos[j];
-                diff[1] = 0; // Ignore Y for horizontal push
+                const diff = self.core.pos[i] - self.core.pos[j];
+                // Removed diff[1] = 0 to allow true 360 spherical collision (sliding over/under)
                 
                 const dist = math.len(diff);
                 const min_dist = cfg.body_radius.mul(Unit.fix(2.0));
                 
                 if (dist.v > 0 and dist.v < min_dist.v) {
                     const overlap = min_dist.sub(dist);
-                    const push = math.scale(diff, overlap.div(dist).mul(Unit.fix(0.5)));
+                    // Increased repulsion factor slightly to prevent getting stuck
+                    const push = math.scale(diff, overlap.div(dist).mul(Unit.fix(0.6)));
                     
                     var push_i = push;
                     var push_j: Vec3 = .{ -push[0], -push[1], -push[2] };
                     
-                    // Treat the push as a 1-tick mock velocity and sweep it against the world.
-                    // This explicitly subordinates player repulsion to world boundaries, 
-                    // cleanly preventing players from being forced out of bounds.
                     slide(self, world, &self.core.pos[i], &push_i, Unit.ONE, i, false, cfg);
                     slide(self, world, &self.core.pos[j], &push_j, Unit.ONE, j, false, cfg);
                 }
