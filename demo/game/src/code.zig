@@ -9,7 +9,12 @@ const BVH = @import("bvh.zig").Tree;
 const FPS_BUCKETS: usize = 501;
 const HUD_PERCENTILE_INTERVAL: u32 = 30;
 
-pub const Action = enum { jump, crouch, fire };
+pub const Action = enum { 
+    forward, back, left, right,
+    jump, crouch, fire,
+    weapon1, weapon2, weapon3, weapon4, melee
+};
+
 pub const AppState = enum { main_menu, settings, loading, playing };
 
 pub const UiState = struct {
@@ -128,9 +133,20 @@ pub const App = struct {
         };
 
         app.in.sensitivity = 1.0; 
+        
+        // Setup initial bindings
+        app.in.bindKey(.forward, sdl.c.SDL_SCANCODE_W);
+        app.in.bindKey(.back, sdl.c.SDL_SCANCODE_S);
+        app.in.bindKey(.left, sdl.c.SDL_SCANCODE_A);
+        app.in.bindKey(.right, sdl.c.SDL_SCANCODE_D);
         app.in.bindKey(.jump, sdl.c.SDL_SCANCODE_SPACE);
         app.in.bindKey(.crouch, sdl.c.SDL_SCANCODE_LCTRL);
         app.in.bindMouse(.fire, sdl.c.SDL_BUTTON_LEFT);
+        app.in.bindKey(.weapon1, sdl.c.SDL_SCANCODE_1);
+        app.in.bindKey(.weapon2, sdl.c.SDL_SCANCODE_2);
+        app.in.bindKey(.weapon3, sdl.c.SDL_SCANCODE_3);
+        app.in.bindKey(.weapon4, sdl.c.SDL_SCANCODE_4);
+        app.in.bindKey(.melee, sdl.c.SDL_SCANCODE_5);
 
         const vert_spv = @embedFile("shaders/triangle.vert.spv");
         const frag_spv = @embedFile("shaders/triangle.frag.spv");
@@ -180,30 +196,55 @@ pub const App = struct {
         }
     }
 
+    fn isActionHeld(self: *const App, a: Action) bool {
+        for (self.in.key_lut, 0..) |opt, sc| {
+            if (opt != null and opt.? == a) {
+                if (self.in.key(@intCast(sc))) return true;
+            }
+        }
+        for (self.in.mouse_lut, 0..) |opt, btn_idx| {
+            if (opt != null and opt.? == a) {
+                const sdl_btn: u8 = switch (btn_idx) { 0=>1, 1=>2, 2=>3, 3=>4, 4=>5, else=>0 };
+                if (self.in.mouse(sdl_btn)) return true;
+            }
+        }
+        return false;
+    }
+
     fn updateSettings(self: *App) !void {
-        // Evaluate keybindings safely outside of the immediate UI render phase
         if (self.ui_state.bind_waiting) |action| {
             if (self.in.keyPressed(sdl.c.SDL_SCANCODE_ESCAPE)) {
                 self.ui_state.bind_waiting = null;
             } else {
-                var iter = self.in.keys_pressed.iterator(.{});
-                if (iter.next()) |sc_idx| {
-                    self.clearBind(action);
-                    self.in.bindKey(action, @intCast(sc_idx));
-                    self.ui_state.bind_waiting = null;
-                }
-                for (0..5) |btn_idx| {
-                    if (self.in.mousePressed(@intCast(btn_idx))) {
+                for (self.in.k_press, 0..) |pressed, sc_idx| {
+                    if (pressed) {
                         self.clearBind(action);
-                        const sdl_btn: u8 = switch (btn_idx) { 0=>1, 1=>2, 2=>3, 3=>4, 4=>5, else=>0 };
-                        self.in.bindMouse(action, sdl_btn);
+                        self.in.bindKey(action, @intCast(sc_idx));
+                        self.ui_state.bind_waiting = null;
+                        break;
+                    }
+                }
+                for (1..6) |sdl_btn| {
+                    if (self.in.mousePressed(@intCast(sdl_btn))) {
+                        self.clearBind(action);
+                        self.in.bindMouse(action, @intCast(sdl_btn));
                         self.ui_state.bind_waiting = null;
                     }
                 }
+                if (self.in.scroll_y > 0) {
+                    self.clearBind(action);
+                    self.in.bindWheel(action, true);
+                    self.ui_state.bind_waiting = null;
+                } else if (self.in.scroll_y < 0) {
+                    self.clearBind(action);
+                    self.in.bindWheel(action, false);
+                    self.ui_state.bind_waiting = null;
+                }
             }
-            // Consume input to prevent instant-activation of buttons behind the bind frame
-            self.in.keys_pressed = std.StaticBitSet(512).initEmpty();
-            @memset(&self.in.mouse_pressed, false);
+            // Consume input to prevent instant-activation
+            @memset(&self.in.k_press, false);
+            self.in.m_press = .{};
+            self.in.scroll_y = 0;
         }
     }
 
@@ -219,32 +260,33 @@ pub const App = struct {
         }
 
         if (self.in.mouse_locked) {
-            self.state.angles[self.player_id] = self.state.angles[self.player_id]
+            self.state.core.angles[self.player_id] = self.state.core.angles[self.player_id]
                 .addY(@intFromFloat(self.in.mouse_dx * 30.0))
                 .addX(@intFromFloat(self.in.mouse_dy * 30.0))
                 .clampPitch();
 
-            if (self.in.keyPressed(sdl.c.SDL_SCANCODE_1)) self.state.weapon_states[self.player_id].id = .pistol;
-            if (self.in.keyPressed(sdl.c.SDL_SCANCODE_2)) self.state.weapon_states[self.player_id].id = .shotgun;
-            if (self.in.keyPressed(sdl.c.SDL_SCANCODE_3)) self.state.weapon_states[self.player_id].id = .rifle;
-            if (self.in.keyPressed(sdl.c.SDL_SCANCODE_4)) self.state.weapon_states[self.player_id].id = .rocket;
+            if (self.in.consume(.weapon1, false)) self.state.core.weapon_states[self.player_id].id = .pistol;
+            if (self.in.consume(.weapon2, false)) self.state.core.weapon_states[self.player_id].id = .shotgun;
+            if (self.in.consume(.weapon3, false)) self.state.core.weapon_states[self.player_id].id = .rifle;
+            if (self.in.consume(.weapon4, false)) self.state.core.weapon_states[self.player_id].id = .rocket;
+            if (self.in.consume(.melee, false)) self.state.core.weapon_states[self.player_id].id = .knife;
         }
 
         const fixed_dt = 1.0 / 60.0;
         while (self.accumulator >= fixed_dt) {
             self.in.tick();
             
-            const w_val = if (self.in.key(sdl.c.SDL_SCANCODE_W) and self.in.mouse_locked) Unit.ONE else if (self.in.key(sdl.c.SDL_SCANCODE_S) and self.in.mouse_locked) Unit.ONE.neg() else Unit.ZERO;
-            const d_val = if (self.in.key(sdl.c.SDL_SCANCODE_D) and self.in.mouse_locked) Unit.ONE else if (self.in.key(sdl.c.SDL_SCANCODE_A) and self.in.mouse_locked) Unit.ONE.neg() else Unit.ZERO;
+            const w_val = if (self.isActionHeld(.forward) and self.in.mouse_locked) Unit.ONE else if (self.isActionHeld(.back) and self.in.mouse_locked) Unit.ONE.neg() else Unit.ZERO;
+            const d_val = if (self.isActionHeld(.right) and self.in.mouse_locked) Unit.ONE else if (self.isActionHeld(.left) and self.in.mouse_locked) Unit.ONE.neg() else Unit.ZERO;
 
-            const angles = self.state.angles[self.player_id];
+            const angles = self.state.core.angles[self.player_id];
             
             var inputs = [_]State.Player.Input{.{}} ** State.MAX_PLAYERS;
             inputs[self.player_id] = .{
                 .wish = wishdir(angles, w_val, d_val),
                 .jump = self.in.consume(.jump, false) and self.in.mouse_locked,
-                .crouch = self.in.consume(.crouch, self.in.key(sdl.c.SDL_SCANCODE_LCTRL)) and self.in.mouse_locked,
-                .fire = self.in.consume(.fire, self.in.mouse(sdl.c.SDL_BUTTON_LEFT)) and self.in.mouse_locked,
+                .crouch = self.in.consume(.crouch, self.isActionHeld(.crouch)) and self.in.mouse_locked,
+                .fire = self.in.consume(.fire, self.isActionHeld(.fire)) and self.in.mouse_locked,
                 .view_angle = angles,
             };
 
@@ -266,7 +308,7 @@ pub const App = struct {
                     
                     try self.ui.upload(self.dev.cmd.?);
                     self.dev.beginRenderPass(.{ 0.03, 0.03, 0.03, 1.0 }, false);
-                    try self.ui.flush();
+                    self.ui.flush(); // <--- REMOVED `try` HERE
                     self.dev.endFrame();
                 },
             }
@@ -278,7 +320,6 @@ pub const App = struct {
     // ============================================================================
     
     fn doLoadMap(self: *App) !void {
-        // Complete teardown ensures absolutely zero memory leaks across map reloads
         self.scene.deinit();
         self.level_bvh.deinit();
         self.render_verts.clearRetainingCapacity();
@@ -290,31 +331,29 @@ pub const App = struct {
         self.level_bvh = BVH.init(self.alloc);
         
         if (self.next_map == 0) {
-            // Brutalist Architecture
-            try self.box(.{0, Unit.fix(-2).v, 0}, Unit.fix(50), Unit.fix(2), Unit.fix(50), .{0.15, 0.15, 0.15, 1.0}); 
-            try self.box(.{0, Unit.fix(20).v, 0}, Unit.fix(50), Unit.fix(2), Unit.fix(50), .{0.05, 0.05, 0.05, 1.0});
+            // Brightened block materials
+            try self.box(.{0, Unit.fix(-2).v, 0}, Unit.fix(50), Unit.fix(2), Unit.fix(50), .{0.65, 0.65, 0.65, 1.0}); 
+            try self.box(.{0, Unit.fix(20).v, 0}, Unit.fix(50), Unit.fix(2), Unit.fix(50), .{0.4, 0.4, 0.4, 1.0});
             
-            try self.box(.{0, Unit.fix(10).v, Unit.fix(-52).v}, Unit.fix(50), Unit.fix(12), Unit.fix(2), .{0.8, 0.1, 0.1, 1.0}); // Red Accent Wall
-            try self.box(.{0, Unit.fix(10).v, Unit.fix(52).v}, Unit.fix(50), Unit.fix(12), Unit.fix(2), .{0.2, 0.2, 0.2, 1.0});
-            try self.box(.{Unit.fix(-52).v, Unit.fix(10).v, 0}, Unit.fix(2), Unit.fix(12), Unit.fix(50), .{0.2, 0.2, 0.2, 1.0});
-            try self.box(.{Unit.fix(52).v, Unit.fix(10).v, 0}, Unit.fix(2), Unit.fix(12), Unit.fix(50), .{0.2, 0.2, 0.2, 1.0});
+            try self.box(.{0, Unit.fix(10).v, Unit.fix(-52).v}, Unit.fix(50), Unit.fix(12), Unit.fix(2), .{0.8, 0.4, 0.4, 1.0}); 
+            try self.box(.{0, Unit.fix(10).v, Unit.fix(52).v}, Unit.fix(50), Unit.fix(12), Unit.fix(2), .{0.75, 0.75, 0.75, 1.0});
+            try self.box(.{Unit.fix(-52).v, Unit.fix(10).v, 0}, Unit.fix(2), Unit.fix(12), Unit.fix(50), .{0.75, 0.75, 0.75, 1.0});
+            try self.box(.{Unit.fix(52).v, Unit.fix(10).v, 0}, Unit.fix(2), Unit.fix(12), Unit.fix(50), .{0.75, 0.75, 0.75, 1.0});
             
-            try self.box(.{0, Unit.fix(4).v, 0}, Unit.fix(4), Unit.fix(4), Unit.fix(4), .{0.15, 0.15, 0.15, 1.0});
-            try self.box(.{Unit.fix(-20).v, Unit.fix(6).v, Unit.fix(20).v}, Unit.fix(6), Unit.fix(0.5), Unit.fix(6), .{0.3, 0.3, 0.3, 1.0});
-            try self.box(.{Unit.fix(20).v, Unit.fix(8).v, Unit.fix(-20).v}, Unit.fix(6), Unit.fix(0.5), Unit.fix(6), .{0.3, 0.3, 0.3, 1.0});
+            try self.box(.{0, Unit.fix(4).v, 0}, Unit.fix(4), Unit.fix(4), Unit.fix(4), .{0.6, 0.6, 0.6, 1.0});
+            try self.box(.{Unit.fix(-20).v, Unit.fix(6).v, Unit.fix(20).v}, Unit.fix(6), Unit.fix(0.5), Unit.fix(6), .{0.7, 0.7, 0.7, 1.0});
+            try self.box(.{Unit.fix(20).v, Unit.fix(8).v, Unit.fix(-20).v}, Unit.fix(6), Unit.fix(0.5), Unit.fix(6), .{0.7, 0.7, 0.7, 1.0});
         }
 
         try self.level_bvh.build();
         self.mesh_h = try self.scene.upload(std.mem.sliceAsBytes(self.render_verts.items), std.mem.sliceAsBytes(self.render_indices.items));
         
         self.head_sphere_h = try self.buildSphere(.{ 0.9, 0.9, 0.9, 1.0 });
-        self.body_sphere_h = try self.buildSphere(.{ 0.5, 0.5, 0.5, 1.0 });
+        self.body_sphere_h = try self.buildSphere(.{ 0.7, 0.7, 0.7, 1.0 });
 
-        // Reset Engine State
         self.state = State.Game{};
         self.player_id = self.state.spawnPlayer(.{ 0, Unit.fix(2).v, Unit.fix(-40).v }) orelse 0;
         
-        // Target Dummies
         _ = self.state.spawnPlayer(.{ Unit.fix(-20).v, Unit.fix(8).v, Unit.fix(20).v });
         _ = self.state.spawnPlayer(.{ Unit.fix(20).v, Unit.fix(10).v, Unit.fix(-20).v });
         _ = self.state.spawnPlayer(.{ Unit.fix(0).v, Unit.fix(10).v, Unit.fix(0).v });
@@ -395,14 +434,13 @@ pub const App = struct {
     // ============================================================================
     fn clearBind(self: *App, action: Action) void {
         for (&self.in.key_lut) |*a| {
-            if (a.* == action) {
-                a.* = null;
-            }
+            if (a.* != null and a.*.? == action) a.* = null;
         }
         for (&self.in.mouse_lut) |*a| {
-            if (a.* == action) {
-                a.* = null;
-            }
+            if (a.* != null and a.*.? == action) a.* = null;
+        }
+        for (&self.in.wheel_lut) |*a| {
+            if (a.* != null and a.*.? == action) a.* = null;
         }
     }
     
@@ -483,19 +521,17 @@ pub const App = struct {
         const title = "SETTINGS";
         const t_scale = 6.0;
         const tw = @as(f32, @floatFromInt(title.len)) * 6.0 * t_scale;
-        try self.ui.drawText(wf/2.0 - tw/2.0, 50.0, t_scale, title, .{1, 1, 1, 1});
-        
-        const bw = 400.0;
-        const bh = 40.0;
-        const bx = wf/2.0 - bw/2.0;
-        var by: f32 = 180.0;
+        try self.ui.drawText(wf/2.0 - tw/2.0, 30.0, t_scale, title, .{1, 1, 1, 1});
         
         var buf: [64]u8 = undefined;
         const sens_str = try std.fmt.bufPrint(&buf, "SENSITIVITY: {d:.2}", .{self.in.sensitivity});
-        if (try self.doButton(10, sens_str, bx, by, bw, bh)) {
+        if (try self.doButton(10, sens_str, wf/2.0 - 200.0, 90.0, 400.0, 40.0)) {
             self.in.sensitivity = if (self.in.sensitivity > 4.9) 0.5 else self.in.sensitivity + 0.5;
         }
-        by += bh + 20.0;
+        
+        const bw = 300.0;
+        const bh = 40.0;
+        const start_y = 150.0;
         
         inline for (std.meta.fields(Action), 0..) |field, idx| {
             const action = @as(Action, @enumFromInt(field.value));
@@ -516,19 +552,30 @@ pub const App = struct {
                         break;
                     }
                 }
+                for (self.in.wheel_lut, 0..) |a, w| {
+                    if (a != null and a.? == action) {
+                        bind_name = if (w == 0) "MW_UP" else "MW_DOWN";
+                        break;
+                    }
+                }
             }
             
             var action_up: [16]u8 = undefined;
             for (field.name, 0..) |c, i| action_up[i] = std.ascii.toUpper(c);
             
             const btn_str = try std.fmt.bufPrint(&buf, "{s}: {s}", .{action_up[0..field.name.len], bind_name});
-            if (try self.doButton(20 + idx, btn_str, bx, by, bw, bh)) {
+            
+            const col = idx % 2;
+            const row = idx / 2;
+            const btn_x = wf/2.0 - 310.0 + @as(f32, @floatFromInt(col)) * 320.0;
+            const btn_y = start_y + @as(f32, @floatFromInt(row)) * (bh + 10.0);
+
+            if (try self.doButton(20 + idx, btn_str, btn_x, btn_y, bw, bh)) {
                 self.ui_state.bind_waiting = action;
             }
-            by += bh + 20.0;
         }
         
-        if (try self.doButton(99, "BACK", bx, hf - 100.0, bw, bh)) {
+        if (try self.doButton(99, "BACK", wf/2.0 - 200.0, hf - 80.0, 400.0, bh)) {
             self.app_state = .main_menu;
             self.ui_state.bind_waiting = null;
         }
@@ -548,7 +595,7 @@ pub const App = struct {
             try self.ui.drawText(cx - 15.0 * 6.0, cy + 10.0, 2.0, "CLICK TO RESUME", .{ 1, 1, 1, 1 });
         }
 
-        const hp = @as(f32, @floatFromInt(self.state.health[self.player_id]));
+        const hp = @as(f32, @floatFromInt(self.state.core.health[self.player_id]));
         const max_hp = 256.0;
         const hp_pct = @max(0.0, hp / max_hp);
         const w = 240.0;
@@ -566,13 +613,13 @@ pub const App = struct {
         const fps_str = try std.fmt.bufPrint(&buf, "FPS: {d} (1%L:{d} 1%H:{d})", .{ @as(u32, @intFromFloat(1.0 / @max(0.0001, self.frame_sum / @as(f32, @floatFromInt(self.frame_times.len))))), self.cached_low_fps, self.cached_high_fps });
         try self.ui.drawText((wf / 2.0) - (@as(f32, @floatFromInt(fps_str.len)) * 12.0) - 10.0, 10.0, 2.0, fps_str, .{ 0.4, 1.0, 0.4, 1.0 });
 
-        const flags = self.state.flags[self.player_id];
+        const flags = self.state.core.flags[self.player_id];
         const cfg = State.Config{};
         const eye_h = if (flags.crouched) cfg.stand_eye.sub(cfg.crouch_offset) else cfg.stand_eye;
-        const v = cameraView(self.state.angles[self.player_id], self.state.pos[self.player_id], eye_h);
+        const v = cameraView(self.state.core.angles[self.player_id], self.state.core.pos[self.player_id], eye_h);
         const vp = math.mulMat(math.persp(90.0, wf / hf, 0.1, 500.0), v);
 
-        for (self.state.projectiles) |r| {
+        for (self.state.core.projectiles) |r| {
             if (!r.active) continue;
             if (projectPos(vp, r.pos, wf, hf)) |proj| {
                 const s1 = @max(2.0, 60.0 / proj[2]);
@@ -601,14 +648,14 @@ pub const App = struct {
 
         try self.ui.upload(self.dev.cmd.?);
         
-        self.dev.beginRenderPass(self.scene.clear_color, true);
+        self.dev.beginRenderPass(.{ 0.45, 0.60, 0.85, 1.0 }, true);
         self.scene.draw(self.mesh_h, vp);
         
         for (0..State.MAX_PLAYERS) |id| {
             if (!self.state.isActive(id) or id == self.player_id) continue;
             
-            const tp = self.state.pos[id];
-            const tf = self.state.flags[id];
+            const tp = self.state.core.pos[id];
+            const tf = self.state.core.flags[id];
             const t_eye_h = if (tf.crouched) cfg.stand_eye.sub(cfg.crouch_offset) else cfg.stand_eye;
             
             const head_pos: Vec3 = .{ tp[0], tp[1] + t_eye_h.v, tp[2] };
@@ -618,7 +665,7 @@ pub const App = struct {
             self.scene.draw(self.body_sphere_h, transformMVP(vp, body_pos, cfg.body_radius.flt()));
         }
 
-        try self.ui.flush();
+        self.ui.flush();
         self.dev.endFrame();
     }
     

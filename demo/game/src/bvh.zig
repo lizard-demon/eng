@@ -1,6 +1,5 @@
 const std = @import("std");
 const math = @import("kami").math;
-const Unit = math.Unit;
 const Vec3 = math.Vec3;
 
 const AABB = struct {
@@ -27,15 +26,14 @@ pub const Tree = struct {
     tri_ids: std.ArrayListUnmanaged(u32) = .{},
     alloc: std.mem.Allocator,
     
-    pub fn init(alloc: std.mem.Allocator) Tree { return .{ .alloc = alloc }; }
-    pub fn deinit(s: *Tree) void { s.nodes.deinit(s.alloc); s.tris.deinit(s.alloc); s.tri_ids.deinit(s.alloc); }
+    pub fn init(alloc: std.mem.Allocator) @This() { return .{ .alloc = alloc }; }
+    pub fn deinit(s: *@This()) void { s.nodes.deinit(s.alloc); s.tris.deinit(s.alloc); s.tri_ids.deinit(s.alloc); }
 
-    pub fn addTri(s: *Tree, a: Vec3, b: Vec3, c: Vec3) !void {
-        const n = math.norm(math.cross(b - a, c - a));
-        try s.tris.append(s.alloc, .{ .a = a, .b = b, .c = c, .n = n });
+    pub fn addTri(s: *@This(), a: Vec3, b: Vec3, c: Vec3) !void {
+        try s.tris.append(s.alloc, .{ .a = a, .b = b, .c = c, .n = math.norm(math.cross(b - a, c - a)) });
     }
 
-    pub fn build(s: *Tree) !void {
+    pub fn build(s: *@This()) !void {
         s.nodes.clearRetainingCapacity(); s.tri_ids.clearRetainingCapacity();
         if (s.tris.items.len == 0) return;
 
@@ -67,7 +65,7 @@ pub const Tree = struct {
         _ = try s.split(entries.items, 0, @intCast(entries.items.len), 29);
     }
 
-    fn split(s: *Tree, e: []const Entry, start: u32, end: u32, bit: i32) !u32 {
+    fn split(s: *@This(), e: []const Entry, start: u32, end: u32, bit: i32) !u32 {
         const idx: u32 = @intCast(s.nodes.items.len);
         try s.nodes.append(s.alloc, .{});
         var b = AABB{};
@@ -92,12 +90,11 @@ pub const Tree = struct {
         return idx;
     }
 
-    pub fn trace(s: *const Tree, start: Vec3, dir: Vec3, max_d: Unit) ?struct { normal: Vec3, dist: Unit } {
+    pub fn trace(s: *const @This(), ro: Vec3, rd: Vec3, max_d: i32) ?struct { normal: Vec3, dist: i32 } {
         if (s.nodes.items.len == 0) return null;
         
-        const ro = start;
-        const rd = dir;
-        const inv_rd = math.invRay(rd);
+        var inv_rd: Vec3 = undefined;
+        inline for (0..3) |i| inv_rd[i] = if (rd[i] == 0) std.math.maxInt(i32) else @intCast(@divTrunc(@as(i64, 1) << 30, rd[i]));
 
         var t_min = max_d;
         var hit_n = Vec3{ 0, 1024, 0 };
@@ -111,17 +108,48 @@ pub const Tree = struct {
             ptr -= 1;
             const node = s.nodes.items[stack[ptr]];
             
-            if (!math.rayAABB(ro, inv_rd, node.aabb.min, node.aabb.max, t_min)) continue;
+            // Fast SIMD AABB test
+            const pad = @as(@Vector(3, i64), @splat(math.EPSILON));
+            const min64 = @as(@Vector(3, i64), node.aabb.min) - pad;
+            const max64 = @as(@Vector(3, i64), node.aabb.max) + pad;
+            const t0 = (min64 - @as(@Vector(3, i64), ro)) * @as(@Vector(3, i64), inv_rd);
+            const t1 = (max64 - @as(@Vector(3, i64), ro)) * @as(@Vector(3, i64), inv_rd);
+            const t_near = @reduce(.Max, @min(t0, t1));
+            const t_far  = @reduce(.Min, @max(t0, t1));
+            
+            if (t_near > t_far or (t_near >> 20) >= t_min) continue;
 
             if (node.count > 0) {
                 for (0..node.count) |i| {
                     const tri = s.tris.items[s.tri_ids.items[node.left + i]];
-                    if (math.rayTri(ro, rd, tri.a, tri.b, tri.c)) |t| {
-                        if (t.v < t_min.v) {
-                            t_min = t; 
-                            hit_n = tri.n; 
-                            hit = true; 
-                        }
+                    
+                    const ro64 = @as(@Vector(3, i64), ro);
+                    const rd64 = @as(@Vector(3, i64), rd);
+                    const ta = @as(@Vector(3, i64), tri.a);
+                    
+                    const e1 = @as(@Vector(3, i64), tri.b) - ta;
+                    const e2 = @as(@Vector(3, i64), tri.c) - ta;
+                    const h = @Vector(3, i64){ rd64[1]*e2[2] - rd64[2]*e2[1], rd64[2]*e2[0] - rd64[0]*e2[2], rd64[0]*e2[1] - rd64[1]*e2[0] };
+                    const det = @reduce(.Add, e1 * h);
+                    
+                    if (det <= 0) continue; 
+                    const edge_eps = math.EPSILON * 8192; 
+
+                    const sv = ro64 - ta;
+                    const u = @reduce(.Add, sv * h);
+                    if (u < -edge_eps or u > det + edge_eps) continue;
+
+                    const q = @Vector(3, i64){ sv[1]*e1[2] - sv[2]*e1[1], sv[2]*e1[0] - sv[0]*e1[2], sv[0]*e1[1] - sv[1]*e1[0] };
+                    const v_val = @reduce(.Add, rd64 * q);
+                    if (v_val < -edge_eps or u + v_val > det + edge_eps) continue;
+
+                    const t_unscaled = @reduce(.Add, e2 * q);
+                    const t = @as(i32, @intCast(@divTrunc(@as(i128, t_unscaled) << 10, @as(i128, det))));
+                    
+                    if (t > 0 and t < t_min) {
+                        t_min = t; 
+                        hit_n = tri.n; 
+                        hit = true; 
                     }
                 }
             } else if (ptr + 1 < stack.len) {
@@ -131,9 +159,6 @@ pub const Tree = struct {
             }
         }
         
-        if (hit) {
-            return .{ .normal = hit_n, .dist = t_min };
-        }
-        return null;
+        return if (hit) .{ .normal = hit_n, .dist = t_min } else null;
     }
 };

@@ -18,7 +18,8 @@ float faceGrid(vec2 uv) {
 
 void main() {
     vec3 n    = normalize(cross(dFdx(v_world_pos), dFdy(v_world_pos)));
-    float shade = max(dot(n, normalize(vec3(0.3, 1.0, 0.5))), 0.15);
+    // Increased ambient from 0.15 to 0.45, normalized boost on directional
+    float shade = max(dot(n, normalize(vec3(0.3, 1.0, 0.5))), 0.45) + 0.25;
 
     vec3 blend = pow(abs(n), vec3(2.0));
     blend /= blend.x + blend.y + blend.z + 1e-5;
@@ -35,6 +36,7 @@ void main() {
                 + faceGrid(uv_y) * blend.y
                 + faceGrid(uv_z) * blend.z;
 
-    vec3 base = v_color.rgb * (0.94 + ck * 0.12);
-    frag_color = vec4(base * shade * (1.0 - lines * 0.55), v_color.a);
+    // Bumped base multiplier to saturate colors more
+    vec3 base = v_color.rgb * (1.3 + ck * 0.15);
+    frag_color = vec4(base * shade * (1.0 - lines * 0.4), v_color.a);
 }
